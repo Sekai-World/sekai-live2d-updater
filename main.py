@@ -58,7 +58,7 @@ async def do_download(dl_list: List[Tuple], config, headers, cookie):
             # Construct the upload command
             src_path: Path = config.ASSET_LOCAL_BUNDLE_CACHE_DIR / "live2d"
             program: str = remote_storage["program"]
-            args: list[str] = remote_storage["args"]
+            args: list[str] = remote_storage["args"][:]
             args[args.index("src")] = str(src_path)
             args[args.index("dst")] = str(remote_path)
             logger.debug(
