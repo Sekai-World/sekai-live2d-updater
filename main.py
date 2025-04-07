@@ -36,7 +36,7 @@ async def do_download(dl_list: List[Tuple], config, headers, cookie):
     # Create and gather download tasks
     tasks = [download_task(url, bundle) for url, bundle in dl_list]
     await asyncio.gather(*tasks)
-    
+
     logger.info("Download completed, restoring live2d motions...")
 
     await restore_live2d_motions(
@@ -45,37 +45,37 @@ async def do_download(dl_list: List[Tuple], config, headers, cookie):
         config.ASSET_LOCAL_EXTRACTED_DIR / "live2d" / "model",
         config.UNITY_VERSION,
     )
-    
+
     logger.info("Restoring completed, uploading...")
-    
+
     for remote_storage in config.ASSET_REMOTE_STORAGE:
         if remote_storage["type"] == "live2d":
             remote_base = remote_storage["base"]
-            upload_cmd = remote_storage["cmd"]
-            
+
             # Construct the remote path
             remote_path = Path(remote_base) / "live2d"
 
             # Construct the upload command
-            src_path = config.ASSET_LOCAL_BUNDLE_CACHE_DIR / "live2d"
-            split_command = upload_cmd.format(src=src_path, dst=remote_path).split(" ")
-            cmd = split_command[0]
-            args = split_command[1:]
+            src_path: Path = config.ASSET_LOCAL_BUNDLE_CACHE_DIR / "live2d"
+            program: str = remote_storage["program"]
+            args: list[str] = remote_storage["args"]
+            args[args.index("src")] = str(src_path)
+            args[args.index("dst")] = str(remote_path)
             logger.debug(
                 "Uploading %s to %s using command: %s %s",
                 src_path,
                 remote_path,
-                cmd,
+                program,
                 " ".join(args),
             )
 
             # Execute the command
-            upload_process = await asyncio.create_subprocess_exec(cmd, *args)
+            upload_process = await asyncio.create_subprocess_exec(program, *args)
             await upload_process.wait()
             if upload_process.returncode != 0:
                 logger.error("Failed to upload %s to %s", src_path, remote_path)
                 raise RuntimeError(
-                    f"Failed to upload {src_path} to {remote_path} using command: {cmd} {' '.join(args)}"
+                    f"Failed to upload {src_path} to {remote_path} using command: {program} {' '.join(args)}"
                 )
             else:
                 logger.info("Successfully uploaded %s to %s", src_path, remote_path)

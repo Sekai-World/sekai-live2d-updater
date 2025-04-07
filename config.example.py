@@ -1,5 +1,4 @@
 import os
-import platform
 
 from anyio import Path
 
@@ -49,7 +48,8 @@ ASSET_LOCAL_BUNDLE_CACHE_DIR = None  # Example: Path("cache", "jp", "bundle")
 ASSET_REMOTE_STORAGE = [
     {
         "type": "live2d",
-        "base": "remote:example-assets/",
-        "cmd": "rclone copy {src} {dst}",
+        "base": "remote:example-bucket/",
+        "program": "rclone",
+        "args": ["copy", "src", "dst"]
     },
 ]

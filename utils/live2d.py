@@ -224,19 +224,19 @@ def read_curve_data(
             )
 
 
-def restore_unity_object_to_motion3(unity_object) -> Tuple:
+def restore_unity_object_to_motion3(unity_object) -> Tuple | None:
     """Restore unity game object to motion3 json format"""
     asset_name = unity_object.ClipAssetName
 
     # Read the animation clip
-    if unity_object.Clip.m_PathID:
+    # Only allow in-file animation clips
+    if unity_object.Clip.m_PathID != 0 and unity_object.Clip.m_FileID == 0:
         animation_clip: UnityPy.classes.AnimationClip = unity_object.Clip.deref().read()
         if not isinstance(animation_clip, UnityPy.classes.AnimationClip):
             raise RuntimeError(f"Failed to read animation clip {asset_name}")
     else:
-        raise RuntimeError(
-            f"Clip path id is empty {unity_object.Clip} for {asset_name}"
-        )
+        logger.warning("Clip path id is empty %s for %s", unity_object.Clip, asset_name)
+        return
 
     # Read meta data from facial_anim
     name = animation_clip.m_Name
@@ -411,6 +411,45 @@ def correct_param_ids(motions: List[Tuple[str, Dict]], param_id_map: Dict[str, s
             except KeyError:
                 logger.warning("unable to find key %s in file %s", curve["Id"], name)
 
+def extract_params_ids_from_moc3(moc3: bytes) -> Dict[str, str]:
+    """Extract parameter IDs from moc3 file"""
+    bs = BinaryStream(BytesIO(moc3))
+    bs.base_stream.seek(0x4C)
+    part_base_addr = bs.readUInt32()
+    part_end_addr = bs.readUInt32()
+
+    cursor = part_base_addr
+    param_id_map = {}
+
+    while part_end_addr - cursor > 64:
+        bs.base_stream.seek(cursor)
+        param_id = bs.readStringToNull()
+        crc = str(crc32(param_id))
+        param_id_map[crc] = param_id.decode()
+        crc = str(crc32(b"Parts/" + param_id))
+        param_id_map[crc] = param_id.decode()
+
+        cursor += 64
+        
+    bs.base_stream.seek(0x108)
+    param_base_addr = bs.readUInt32()
+    param_end_addr = bs.readUInt32()
+
+    cursor = param_base_addr
+
+    while param_end_addr - cursor > 64:
+        bs.base_stream.seek(cursor)
+        param_id = bs.readStringToNull()
+        crc = str(crc32(param_id))
+        param_id_map[crc] = param_id.decode()
+        crc = str(crc32(b"Parameters/" + param_id))
+        param_id_map[crc] = param_id.decode()
+
+        cursor += 64
+
+    return param_id_map
+
+
 
 async def restore_live2d_motions(
     local_live2d_motion_bundle_cache_dir: Path,
@@ -430,43 +469,12 @@ async def restore_live2d_motions(
         )
 
     # Gather param ID map
-    param_id_map = {}
-    async for moc3_path in local_live2d_model_extracted_dir.glob("*/*.moc3"):
+    param_id_map: Dict[str, str] = {}
+    async for moc3_path in local_live2d_model_extracted_dir.glob("**/*.moc3"):
         async with await open_file(moc3_path, "rb") as f:
             moc3 = await f.read()
-            bs = BinaryStream(moc3)
-            bs.base_stream.seek(0x4C)
-            part_base_addr = bs.readUInt32()
-            part_end_addr = bs.readUInt32()
-
-            cursor = part_base_addr
-
-            while part_end_addr - cursor > 64:
-                bs.base_stream.seek(cursor)
-                param_id = bs.readStringToNull()
-                crc = str(crc32(param_id))
-                param_id_map[crc] = param_id.decode()
-                crc = str(crc32(b"Parts/" + param_id))
-                param_id_map[crc] = param_id.decode()
-
-                cursor += 64
-
-            bs.base_stream.seek(0x108)
-            param_base_addr = bs.readUInt32()
-            param_end_addr = bs.readUInt32()
-
-            cursor = param_base_addr
-
-            while param_end_addr - cursor > 64:
-                bs.base_stream.seek(cursor)
-                param_id = bs.readStringToNull()
-                crc = str(crc32(param_id))
-                param_id_map[crc] = param_id.decode()
-                crc = str(crc32(b"Parameters/" + param_id))
-                param_id_map[crc] = param_id.decode()
-
-                cursor += 64
-    logger.info("Param ID map: %s", param_id_map)
+            param_id_map.update(extract_params_ids_from_moc3(moc3))
+    logger.debug("Param ID map: %s", param_id_map)
 
     # Process all motion bundles
     async for motion_base_bundle_path in local_live2d_motion_bundle_cache_dir.glob("*"):
@@ -496,11 +504,16 @@ async def restore_live2d_motions(
             restore_unity_object_to_motion3(facial)
             for facial in buildmotiondata.Facials
         ]
+        # filter out empty facials
+        facials = [facial for facial in facials if facial is not None]
         correct_param_ids(facials, param_id_map)
+        
         motions = [
             restore_unity_object_to_motion3(motion)
             for motion in buildmotiondata.Motions
         ]
+        # filter out empty motions
+        motions = [motion for motion in motions if motion is not None]
         correct_param_ids(motions, param_id_map)
 
         _reldir = Path(buildmotiondata_path).relative_to(UNITY_FS_CONTAINER_BASE).parent
