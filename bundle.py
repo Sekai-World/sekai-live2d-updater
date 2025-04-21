@@ -1,10 +1,7 @@
 """This module contains functions to download, deobfuscate, and extract asset bundles."""
 
-import asyncio
 import orjson as json
 import logging
-import re
-from io import BytesIO
 from typing import Dict, List, Tuple
 
 import aiohttp
@@ -15,13 +12,11 @@ from anyio import Path, open_file
 
 from constants import UNITY_FS_CONTAINER_BASE
 from helpers import deobfuscate
-from utils.acb import extract_acb
 from utils.live2d import (
     correct_param_ids,
     extract_params_ids_from_moc3,
     restore_unity_object_to_motion3,
 )
-from utils.usm import extract_usm
 
 logger = logging.getLogger("live2d")
 
