@@ -74,37 +74,37 @@ async def do_download(dl_list: List[Tuple], config, headers, cookie):
     if config.ASSET_REMOTE_STORAGE:
         logger.info("Uploading live2d assets...")
 
-    for remote_storage in config.ASSET_REMOTE_STORAGE:
-        if remote_storage["type"] == "live2d":
-            remote_base = remote_storage["base"]
+        for remote_storage in config.ASSET_REMOTE_STORAGE:
+            if remote_storage["type"] == "live2d":
+                remote_base = remote_storage["base"]
 
-            # Construct the remote path
-            remote_path = Path(remote_base) / "live2d"
+                # Construct the remote path
+                remote_path = Path(remote_base) / "live2d"
 
-            # Construct the upload command
-            src_path: Path = config.ASSET_LOCAL_EXTRACTED_DIR / "live2d"
-            program: str = remote_storage["program"]
-            args: list[str] = remote_storage["args"][:]
-            args[args.index("src")] = str(src_path)
-            args[args.index("dst")] = str(remote_path)
-            logger.debug(
-                "Uploading %s to %s using command: %s %s",
-                src_path,
-                remote_path,
-                program,
-                " ".join(args),
-            )
-
-            # Execute the command
-            upload_process = await asyncio.create_subprocess_exec(program, *args)
-            await upload_process.wait()
-            if upload_process.returncode != 0:
-                logger.error("Failed to upload %s to %s", src_path, remote_path)
-                raise RuntimeError(
-                    f"Failed to upload {src_path} to {remote_path} using command: {program} {' '.join(args)}"
+                # Construct the upload command
+                src_path: Path = config.ASSET_LOCAL_EXTRACTED_DIR / "live2d"
+                program: str = remote_storage["program"]
+                args: list[str] = remote_storage["args"][:]
+                args[args.index("src")] = str(src_path)
+                args[args.index("dst")] = str(remote_path)
+                logger.debug(
+                    "Uploading %s to %s using command: %s %s",
+                    src_path,
+                    remote_path,
+                    program,
+                    " ".join(args),
                 )
-            else:
-                logger.info("Successfully uploaded %s to %s", src_path, remote_path)
+
+                # Execute the command
+                upload_process = await asyncio.create_subprocess_exec(program, *args)
+                await upload_process.wait()
+                if upload_process.returncode != 0:
+                    logger.error("Failed to upload %s to %s", src_path, remote_path)
+                    raise RuntimeError(
+                        f"Failed to upload {src_path} to {remote_path} using command: {program} {' '.join(args)}"
+                    )
+                else:
+                    logger.info("Successfully uploaded %s to %s", src_path, remote_path)
 
 
 async def main():
