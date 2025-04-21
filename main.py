@@ -39,14 +39,40 @@ async def do_download(dl_list: List[Tuple], config, headers, cookie):
 
     logger.info("Download completed, restoring live2d motions...")
 
-    await restore_live2d_motions(
-        config.ASSET_LOCAL_BUNDLE_CACHE_DIR / "live2d" / "motion",
-        config.ASSET_LOCAL_EXTRACTED_DIR / "live2d" / "motion",
-        config.ASSET_LOCAL_EXTRACTED_DIR / "live2d" / "model",
-        config.UNITY_VERSION,
-    )
+    if len(dl_list):
+        await restore_live2d_motions(
+            config.ASSET_LOCAL_BUNDLE_CACHE_DIR / "live2d" / "motion",
+            config.ASSET_LOCAL_EXTRACTED_DIR / "live2d" / "motion",
+            config.ASSET_LOCAL_EXTRACTED_DIR / "live2d" / "model",
+            config.UNITY_VERSION,
+        )
 
-    logger.info("Restoring completed, uploading...")
+    logger.info("Restoring completed, generating model list...")
+    
+    # Glob for all model files
+    model_dir: Path = config.ASSET_LOCAL_EXTRACTED_DIR / "live2d" / "model"
+    model_list = []
+    async for model_file in model_dir.glob("**/*.model3.json"):
+        model_name = model_file.name.replace(".model3.json", "")
+        model_path = model_file.parent.relative_to(model_dir)
+        
+        model_list.append({
+            "modelName": model_name,
+            "modelBase": str(model_file.parent.name),
+            "modelPath": str(model_path),
+            "modelFile": model_file.name,
+        })
+        
+    logger.debug("Model list generated, %s", model_list)
+    # Save the model list to a json file
+    model_list_path = config.ASSET_LOCAL_EXTRACTED_DIR / "live2d" / "model_list.json"
+    async with await open_file(model_list_path, "wb") as f:
+        await f.write(json.dumps(model_list, option=json.OPT_INDENT_2))
+        
+    logger.info("Model list saved to %s", model_list_path)
+    
+    if config.ASSET_REMOTE_STORAGE:
+        logger.info("Uploading live2d assets...")
 
     for remote_storage in config.ASSET_REMOTE_STORAGE:
         if remote_storage["type"] == "live2d":
