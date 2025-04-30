@@ -233,7 +233,7 @@ def restore_unity_object_to_motion3(unity_object) -> Tuple | None:
     if unity_object.Clip.m_PathID != 0 and unity_object.Clip.m_FileID == 0:
         animation_clip: UnityPy.classes.AnimationClip = unity_object.Clip.deref().read()
         if not isinstance(animation_clip, UnityPy.classes.AnimationClip):
-            raise RuntimeError(f"Failed to read animation clip {asset_name}")
+            raise RuntimeError(f"Failed to read animation clip {asset_name}, expected AnimationClip, got {type(animation_clip)}")
     else:
         logger.warning("Clip path id is empty %s for %s", unity_object.Clip, asset_name)
         return
@@ -450,6 +450,22 @@ def extract_params_ids_from_moc3(moc3: bytes) -> Dict[str, str]:
     return param_id_map
 
 
+class Live2DBuildMotion:
+    ClipAssetName: str
+    Clip: UnityPy.classes.PPtr[UnityPy.classes.AnimationClip]
+
+    def __init__(self, clip_asset_name: str, clip: UnityPy.classes.PPtr[UnityPy.classes.AnimationClip]):
+        self.ClipAssetName = clip_asset_name
+        self.Clip = clip
+        
+    def __repr__(self) -> str:
+        return str(
+            {
+                "ClipAssetName": self.ClipAssetName,
+                "Clip": self.Clip,
+            }
+        )
+
 
 async def restore_live2d_motions(
     local_live2d_motion_bundle_cache_dir: Path,
@@ -504,6 +520,29 @@ async def restore_live2d_motions(
             restore_unity_object_to_motion3(facial)
             for facial in buildmotiondata.Facials
         ]
+        if not facials and not buildmotiondata.Motions:
+            logger.warning(
+                "No facials found in %s, try searching container items",
+                motion_base_bundle_path,
+            )
+            # Try to find facials in container items
+            container_facials = [
+                Live2DBuildMotion(Path(asset_path).stem, pptr)
+                for asset_path, pptr in container_items
+                if Path(asset_path).parent.name == "facial" and Path(asset_path).suffix == ".anim"
+            ]
+            if not container_facials:
+                logger.exception(
+                    "Failed to find facials in %s after searching container items",
+                    motion_base_bundle_path,
+                )
+                raise RuntimeError(
+                    f"Failed to find facials in {motion_base_bundle_path}"
+                )
+            facials = [
+                restore_unity_object_to_motion3(facial)
+                for facial in container_facials
+            ]
         # filter out empty facials
         facials = [facial for facial in facials if facial is not None]
         correct_param_ids(facials, param_id_map)
@@ -512,6 +551,28 @@ async def restore_live2d_motions(
             restore_unity_object_to_motion3(motion)
             for motion in buildmotiondata.Motions
         ]
+        if not motions and not buildmotiondata.Motions:
+            logger.warning(
+                "No motions found in %s, try searching container items",
+                motion_base_bundle_path,
+            )
+            # Try to find motions in container items
+            container_motions = [
+                Live2DBuildMotion(Path(asset_path).stem, pptr)
+                for asset_path, pptr in container_items
+                if Path(asset_path).parent.name == "motion" and Path(asset_path).suffix == ".anim"
+            ]
+            if not container_motions:
+                logger.exception(
+                    "Failed to find motions in %s after searching container items",
+                    motion_base_bundle_path,
+                )
+                raise RuntimeError(
+                    f"Failed to find motions in {motion_base_bundle_path}"
+                )
+            motions = [
+                restore_unity_object_to_motion3(motion) for motion in container_motions
+            ]
         # filter out empty motions
         motions = [motion for motion in motions if motion is not None]
         correct_param_ids(motions, param_id_map)
