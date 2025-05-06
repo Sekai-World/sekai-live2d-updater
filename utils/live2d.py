@@ -233,9 +233,15 @@ def restore_unity_object_to_motion3(unity_object) -> Tuple | None:
     if unity_object.Clip.m_PathID != 0 and unity_object.Clip.m_FileID == 0:
         animation_clip: UnityPy.classes.AnimationClip = unity_object.Clip.deref().read()
         if not isinstance(animation_clip, UnityPy.classes.AnimationClip):
-            raise RuntimeError(f"Failed to read animation clip {asset_name}, expected AnimationClip, got {type(animation_clip)}")
+            raise RuntimeError(
+                f"Failed to read animation clip {asset_name}, expected AnimationClip, got {type(animation_clip)}"
+            )
     else:
-        logger.warning("Clip path id is empty %s for %s", unity_object.Clip, asset_name)
+        logger.warning(
+            "Clip path id is empty or file id is not 0, reading %s for %s",
+            unity_object.Clip,
+            asset_name,
+        )
         return
 
     # Read meta data from facial_anim
@@ -411,6 +417,7 @@ def correct_param_ids(motions: List[Tuple[str, Dict]], param_id_map: Dict[str, s
             except KeyError:
                 logger.warning("unable to find key %s in file %s", curve["Id"], name)
 
+
 def extract_params_ids_from_moc3(moc3: bytes) -> Dict[str, str]:
     """Extract parameter IDs from moc3 file"""
     bs = BinaryStream(BytesIO(moc3))
@@ -430,7 +437,7 @@ def extract_params_ids_from_moc3(moc3: bytes) -> Dict[str, str]:
         param_id_map[crc] = param_id.decode()
 
         cursor += 64
-        
+
     bs.base_stream.seek(0x108)
     param_base_addr = bs.readUInt32()
     param_end_addr = bs.readUInt32()
@@ -454,10 +461,14 @@ class Live2DBuildMotion:
     ClipAssetName: str
     Clip: UnityPy.classes.PPtr[UnityPy.classes.AnimationClip]
 
-    def __init__(self, clip_asset_name: str, clip: UnityPy.classes.PPtr[UnityPy.classes.AnimationClip]):
+    def __init__(
+        self,
+        clip_asset_name: str,
+        clip: UnityPy.classes.PPtr[UnityPy.classes.AnimationClip],
+    ):
         self.ClipAssetName = clip_asset_name
         self.Clip = clip
-        
+
     def __repr__(self) -> str:
         return str(
             {
@@ -529,7 +540,8 @@ async def restore_live2d_motions(
             container_facials = [
                 Live2DBuildMotion(Path(asset_path).stem, pptr)
                 for asset_path, pptr in container_items
-                if Path(asset_path).parent.name == "facial" and Path(asset_path).suffix == ".anim"
+                if Path(asset_path).parent.name == "facial"
+                and Path(asset_path).suffix == ".anim"
             ]
             if not container_facials:
                 logger.exception(
@@ -540,13 +552,12 @@ async def restore_live2d_motions(
                     f"Failed to find facials in {motion_base_bundle_path}"
                 )
             facials = [
-                restore_unity_object_to_motion3(facial)
-                for facial in container_facials
+                restore_unity_object_to_motion3(facial) for facial in container_facials
             ]
         # filter out empty facials
         facials = [facial for facial in facials if facial is not None]
         correct_param_ids(facials, param_id_map)
-        
+
         motions = [
             restore_unity_object_to_motion3(motion)
             for motion in buildmotiondata.Motions
@@ -560,7 +571,8 @@ async def restore_live2d_motions(
             container_motions = [
                 Live2DBuildMotion(Path(asset_path).stem, pptr)
                 for asset_path, pptr in container_items
-                if Path(asset_path).parent.name == "motion" and Path(asset_path).suffix == ".anim"
+                if Path(asset_path).parent.name == "motion"
+                and Path(asset_path).suffix == ".anim"
             ]
             if not container_motions:
                 logger.exception(
