@@ -1,8 +1,9 @@
 """This module contains functions to download, deobfuscate, and extract asset bundles."""
 
+import asyncio
 import orjson as json
 import logging
-from typing import Dict, List, Tuple
+from typing import Awaitable, Callable, Dict, List, Tuple
 
 import aiohttp
 import UnityPy
@@ -22,6 +23,9 @@ from utils.live2d import (
 )
 
 logger = logging.getLogger("live2d")
+DEOBFUSCATION_XOR_MASK = (b"\xff" * 5 + b"\x00" * 3) * 16
+DOWNLOAD_CHUNK_SIZE = 1 << 16
+HeadersProvider = Callable[[bool], Awaitable[Dict[str, str]]]
 
 
 def _render_sprite_with_fallback(data: UnityPy.classes.Sprite) -> Image.Image:
@@ -97,23 +101,103 @@ def _render_image_asset(
     return data.image
 
 
+async def write_deobfuscated_bundle(
+    response: aiohttp.ClientResponse,
+    bundle_save_path: Path,
+) -> None:
+    mode = None
+    header_written = False
+    pending = bytearray()
+
+    async with await open_file(bundle_save_path, "wb") as f:
+        async for chunk in response.content.iter_chunked(DOWNLOAD_CHUNK_SIZE):
+            pending.extend(chunk)
+
+            if mode is None:
+                if len(pending) < 4:
+                    continue
+
+                prefix = bytes(pending[:4])
+                if prefix == b"\x20\x00\x00\x00":
+                    mode = "strip4"
+                    del pending[:4]
+                    header_written = True
+                elif prefix == b"\x10\x00\x00\x00":
+                    mode = "xor128"
+                    del pending[:4]
+                else:
+                    mode = "plain"
+                    header_written = True
+
+            if mode == "xor128" and not header_written:
+                if len(pending) < 128:
+                    continue
+
+                header = bytes(
+                    a ^ b for a, b in zip(pending[:128], DEOBFUSCATION_XOR_MASK)
+                )
+                await f.write(header)
+                del pending[:128]
+                header_written = True
+
+            if header_written and pending:
+                await f.write(pending)
+                pending.clear()
+
+        if mode is None:
+            await f.write(pending)
+        elif mode == "xor128" and not header_written:
+            header = bytes(
+                a ^ b for a, b in zip(pending[:128], DEOBFUSCATION_XOR_MASK)
+            )
+            await f.write(header)
+            await f.write(pending[128:])
+        elif pending:
+            await f.write(pending)
+
+
 async def download_deobfuscate_bundle(
-    url: str, bundle_save_path: Path, headers: Dict[str, str]
-) -> Tuple[str, Dict]:
+    url: str,
+    bundle_save_path: Path,
+    session: aiohttp.ClientSession,
+    headers_provider: HeadersProvider,
+    max_retries: int = 5,
+    retry_delay: float = 2.0,
+) -> None:
     """Download and deobfuscate the bundle."""
-    # Download the bundle
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as response:
-            if response.status == 200:
-                # Read the response data
-                data = await response.read()
-                # Deobfuscate the data
-                deobfuscated_data = await deobfuscate(data)
-                # Save the deobfuscated data to the file
-                async with await open_file(bundle_save_path, "wb") as f:
-                    await f.write(deobfuscated_data)
+    last_exc = None
+    force_refresh_headers = False
+    for attempt in range(1, max_retries + 1):
+        try:
+            headers = await headers_provider(force_refresh_headers)
+            force_refresh_headers = False
+            async with session.get(url, headers=headers) as response:
+                if response.status != 200:
+                    if response.status in {401, 403}:
+                        force_refresh_headers = True
+                    raise aiohttp.ClientError(
+                        f"Failed to download {url} (status {response.status})"
+                    )
+
+                await write_deobfuscated_bundle(response, bundle_save_path)
+                return
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, RuntimeError) as e:
+            last_exc = e
+            if await bundle_save_path.exists():
+                await bundle_save_path.unlink()
+            if attempt < max_retries:
+                delay = retry_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    "Download failed (attempt %d/%d): %s, retrying in %.1fs",
+                    attempt,
+                    max_retries,
+                    e,
+                    delay,
+                )
+                await asyncio.sleep(delay)
             else:
-                raise aiohttp.ClientError(f"Failed to download {url}")
+                logger.error("Download failed after %d attempts: %s", max_retries, url)
+    raise last_exc
 
 
 async def extract_asset_bundle(

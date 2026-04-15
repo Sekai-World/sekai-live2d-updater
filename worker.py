@@ -2,10 +2,11 @@ import logging
 import tempfile
 from typing import Dict, Tuple, Union
 
+import aiohttp
 from anyio import Path
 
 from bundle import download_deobfuscate_bundle, extract_asset_bundle
-from helpers import refresh_cookie
+from helpers import CookieManager
 
 logger = logging.getLogger("live2d")
 
@@ -14,14 +15,12 @@ async def worker(
     name: str,
     dl_info: Tuple[str, Dict],
     config,
-    headers: Dict[str, str],
-    cookie: str = None,
+    session: aiohttp.ClientSession,
+    cookie_manager: CookieManager,
 ):
     url, bundle = dl_info
 
     logger.debug("worker %s processing %s", name, bundle.get("bundleName", url))
-
-    headers, cookie = await refresh_cookie(config, headers, cookie)
 
     bundle_save_path: Union[Path, None] = None
     tmp_bundle_save_file = None
@@ -37,7 +36,8 @@ async def worker(
         await download_deobfuscate_bundle(
             url,
             bundle_save_path,
-            headers=headers,
+            session=session,
+            headers_provider=cookie_manager.get_headers,
         )
     else:
         # Save the bundle to the temp directory
@@ -48,7 +48,8 @@ async def worker(
         await download_deobfuscate_bundle(
             url,
             bundle_save_path,
-            headers=headers,
+            session=session,
+            headers_provider=cookie_manager.get_headers,
         )
 
     # Get the extracted save path
