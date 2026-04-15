@@ -535,7 +535,17 @@ async def restore_live2d_motions(
     ):
         try:
             async with await open_file(param_id_cache_path, "rb") as f:
-                param_id_map = json.loads(await f.read())
+                loaded_param_id_map = json.loads(await f.read())
+            if (
+                isinstance(loaded_param_id_map, dict)
+                and all(
+                    isinstance(key, str) and isinstance(value, str)
+                    for key, value in loaded_param_id_map.items()
+                )
+            ):
+                param_id_map = loaded_param_id_map
+            else:
+                logger.warning("Param id cache has invalid structure, rebuilding")
         except (OSError, ValueError):
             logger.warning("Failed to load param id cache, rebuilding", exc_info=True)
 

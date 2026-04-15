@@ -201,16 +201,20 @@ class CookieManager:
             and self._cookie_expire_time > int(time.time()) + 3600
         )
 
-    async def get_cookie(self) -> str | None:
+    async def get_cookie(self, force_refresh: bool = False) -> str | None:
         if not self._config.GAME_COOKIE_URL:
             return None
 
-        if self._has_valid_cookie():
+        if not force_refresh and self._has_valid_cookie():
             return self._cookie
 
         async with self._lock:
-            if self._has_valid_cookie():
+            if not force_refresh and self._has_valid_cookie():
                 return self._cookie
+
+            if force_refresh:
+                self._cookie = None
+                self._cookie_expire_time = None
 
             async with self._session.post(
                 self._config.GAME_COOKIE_URL,
@@ -231,9 +235,9 @@ class CookieManager:
 
         return self._cookie
 
-    async def get_headers(self) -> Dict[str, str]:
+    async def get_headers(self, force_refresh: bool = False) -> Dict[str, str]:
         headers = dict(self._base_headers)
-        cookie = await self.get_cookie()
+        cookie = await self.get_cookie(force_refresh=force_refresh)
         if cookie:
             headers["Cookie"] = cookie
         return headers

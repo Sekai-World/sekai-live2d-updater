@@ -46,7 +46,7 @@ async def do_download(
     logger.info("Download completed, restoring live2d motions...")
 
     changed_motion_bundle_names = {
-        Path(bundle["bundleName"]).name
+        Path(bundle["bundleName"]).relative_to("live2d/motion").as_posix()
         for _, bundle in dl_list
         if bundle.get("bundleName", "").startswith("live2d/motion/")
     }

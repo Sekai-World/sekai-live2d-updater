@@ -22,8 +22,6 @@ async def worker(
 
     logger.debug("worker %s processing %s", name, bundle.get("bundleName", url))
 
-    headers = await cookie_manager.get_headers()
-
     bundle_save_path: Union[Path, None] = None
     tmp_bundle_save_file = None
     if isinstance(config.ASSET_LOCAL_BUNDLE_CACHE_DIR, Path):
@@ -39,7 +37,7 @@ async def worker(
             url,
             bundle_save_path,
             session=session,
-            headers=headers,
+            headers_provider=cookie_manager.get_headers,
         )
     else:
         # Save the bundle to the temp directory
@@ -51,7 +49,7 @@ async def worker(
             url,
             bundle_save_path,
             session=session,
-            headers=headers,
+            headers_provider=cookie_manager.get_headers,
         )
 
     # Get the extracted save path

@@ -3,7 +3,7 @@
 import asyncio
 import orjson as json
 import logging
-from typing import Dict, List, Tuple
+from typing import Awaitable, Callable, Dict, List, Tuple
 
 import aiohttp
 import UnityPy
@@ -25,6 +25,7 @@ from utils.live2d import (
 logger = logging.getLogger("live2d")
 DEOBFUSCATION_XOR_MASK = (b"\xff" * 5 + b"\x00" * 3) * 16
 DOWNLOAD_CHUNK_SIZE = 1 << 16
+HeadersProvider = Callable[[bool], Awaitable[Dict[str, str]]]
 
 
 def _render_sprite_with_fallback(data: UnityPy.classes.Sprite) -> Image.Image:
@@ -159,23 +160,28 @@ async def download_deobfuscate_bundle(
     url: str,
     bundle_save_path: Path,
     session: aiohttp.ClientSession,
-    headers: Dict[str, str],
+    headers_provider: HeadersProvider,
     max_retries: int = 5,
     retry_delay: float = 2.0,
-) -> Tuple[str, Dict]:
+) -> None:
     """Download and deobfuscate the bundle."""
     last_exc = None
+    force_refresh_headers = False
     for attempt in range(1, max_retries + 1):
         try:
+            headers = await headers_provider(force_refresh_headers)
+            force_refresh_headers = False
             async with session.get(url, headers=headers) as response:
                 if response.status != 200:
+                    if response.status in {401, 403}:
+                        force_refresh_headers = True
                     raise aiohttp.ClientError(
                         f"Failed to download {url} (status {response.status})"
                     )
 
                 await write_deobfuscated_bundle(response, bundle_save_path)
                 return
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, RuntimeError) as e:
             last_exc = e
             if await bundle_save_path.exists():
                 await bundle_save_path.unlink()
