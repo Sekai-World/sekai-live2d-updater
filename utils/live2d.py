@@ -33,6 +33,17 @@ def format_float(num):
     return num
 
 
+def get_curve_span(binding: UnityPy.classes.GenericBinding) -> int:
+    if binding.typeID != UnityPy.enums.ClassIDType.Transform:
+        return 1
+
+    if binding.attribute in [1, 3, 4]:
+        return 3
+    if binding.attribute == 2:
+        return 4
+    return 1
+
+
 class StreamedCurveKey(object):
 
     def __init__(self, bs):
@@ -111,117 +122,126 @@ def process_streamed_clip(streamed_clip: List[int]) -> List:
             continue
         ret.append({"time": time, "keyList": key_list})
 
-    for k, v in enumerate(ret):
-        if k < 2 or k == len(ret) - 1:
-            continue
-
-        for ck in v["keyList"]:
-            for fI in range(k - 1, 0, -1):
-                pre_frame = ret[fI]
-                pre_curve_key = next(
-                    (x for x in pre_frame["keyList"] if x.index == ck.index), None
+    previous_curve_keys: Dict[int, Tuple[float, StreamedCurveKey]] = {}
+    for frame_idx, frame in enumerate(ret):
+        if frame_idx > 1:
+            prev_frame = ret[frame_idx - 1]
+            for prev_curve_key in prev_frame["keyList"]:
+                previous_curve_keys[prev_curve_key.index] = (
+                    prev_frame["time"],
+                    prev_curve_key,
                 )
 
-                if pre_curve_key:
-                    ck.inSlope = pre_curve_key.calc_next_in_slope(
-                        v["time"] - pre_frame["time"], ck
-                    )
-                    break
+        if frame_idx < 2 or frame_idx == len(ret) - 1:
+            continue
+
+        for curve_key in frame["keyList"]:
+            previous_curve = previous_curve_keys.get(curve_key.index)
+            if previous_curve is None:
+                continue
+
+            prev_time, prev_curve_key = previous_curve
+            curve_key.inSlope = prev_curve_key.calc_next_in_slope(
+                frame["time"] - prev_time,
+                curve_key,
+            )
 
     return ret
 
 
-def read_streamed_data(
-    motion: Dict,
+def build_binding_map(
     clip_binding_constant: UnityPy.classes.AnimationClipBindingConstant,
+) -> Dict[int, Tuple[str, str] | None]:
+    binding_map: Dict[int, Tuple[str, str] | None] = {}
+    curve_idx = 0
+
+    for binding_constant in clip_binding_constant.genericBindings:
+        mono_script = binding_constant.script.deref().read()
+        target, bone_name = live2d_target_map[mono_script.m_Name]
+        if not bone_name:
+            bone_name = str(binding_constant.path)
+
+        binding_value = (target, bone_name) if bone_name else None
+        curve_span = get_curve_span(binding_constant)
+        for idx in range(curve_idx, curve_idx + curve_span):
+            binding_map[idx] = binding_value
+        curve_idx += curve_span
+
+    return binding_map
+
+
+def append_curve(
+    tracks: Dict[str, Dict],
+    target: str,
+    bone_name: str,
+    curve: Dict,
+) -> None:
+    track = tracks.get(bone_name)
+    if not track:
+        tracks[bone_name] = {
+            "Name": bone_name,
+            "Target": target,
+            "Curve": [curve],
+        }
+        return
+
+    track["Curve"].append(curve)
+
+
+def read_streamed_data(
+    tracks: Dict[str, Dict],
+    binding_map: Dict[int, Tuple[str, str] | None],
     time: float,
     curve_key: StreamedCurveKey,
 ):
-    idx = curve_key.index
-    binding_constant = find_binding(clip_binding_constant.genericBindings, idx)
-    if binding_constant is None:
-        raise RuntimeError(
-            f"Failed to find binding constant for {idx} in {clip_binding_constant}"
-        )
-    mono_script = binding_constant.script.deref().read()
-    target, bone_name = live2d_target_map[mono_script.m_Name]
-    if not bone_name:
-        bone_name = str(binding_constant.path)
-    if bone_name:
-        track = next((x for x in motion["TrackList"] if x["Name"] == bone_name), None)
-        if not track:
-            track = {
-                "Name": bone_name,
-                "Target": target,
-                "Curve": [
-                    {
-                        "time": time,
-                        "value": curve_key.value,
-                        "inSlope": curve_key.inSlope,
-                        "outSlope": curve_key.outSlope,
-                        "coeff": curve_key.coeff,
-                    }
-                ],
-            }
-            motion["TrackList"].append(track)
-        else:
-            # track["Target"] = target
-            track["Curve"].append(
-                {
-                    "time": time,
-                    "value": curve_key.value,
-                    "inSlope": curve_key.inSlope,
-                    "outSlope": curve_key.outSlope,
-                    "coeff": curve_key.coeff,
-                }
-            )
+    if curve_key.index not in binding_map:
+        raise RuntimeError(f"Failed to find binding constant for {curve_key.index}")
+    binding = binding_map[curve_key.index]
+    if binding is None:
+        return
+
+    target, bone_name = binding
+    append_curve(
+        tracks,
+        target,
+        bone_name,
+        {
+            "time": time,
+            "value": curve_key.value,
+            "inSlope": curve_key.inSlope,
+            "outSlope": curve_key.outSlope,
+            "coeff": curve_key.coeff,
+        },
+    )
 
 
 def read_curve_data(
-    motion: Dict,
-    clip_binding_constant: UnityPy.classes.AnimationClipBindingConstant,
+    tracks: Dict[str, Dict],
+    binding_map: Dict[int, Tuple[str, str] | None],
     idx: int,
     time: float,
     sample_list: List[float],
     curve_idx: int,
 ):
-    binding_constant = find_binding(clip_binding_constant.genericBindings, idx)
-    if binding_constant is None:
-        raise RuntimeError(
-            f"Failed to find binding constant for {idx} in {clip_binding_constant}"
-        )
-    mono_script = binding_constant.script.deref().read()
-    target, bone_name = live2d_target_map[mono_script.m_Name]
-    if not bone_name:
-        bone_name = str(binding_constant.path)
-    if bone_name:
-        track = next((x for x in motion["TrackList"] if x["Name"] == bone_name), None)
-        if not track:
-            track = {
-                "Name": bone_name,
-                "Target": target,
-                "Curve": [
-                    {
-                        "time": time,
-                        "value": sample_list[curve_idx],
-                        "inSlope": 0,
-                        "outSlope": 0,
-                        "coeff": None,
-                    }
-                ],
-            }
-            motion["TrackList"].append(track)
-        else:
-            # track["Target"] = target
-            track["Curve"].append(
-                {
-                    "time": time,
-                    "value": sample_list[curve_idx],
-                    "inSlope": 0,
-                    "outSlope": 0,
-                    "coeff": None,
-                }
-            )
+    if idx not in binding_map:
+        raise RuntimeError(f"Failed to find binding constant for {idx}")
+    binding = binding_map[idx]
+    if binding is None:
+        return
+
+    target, bone_name = binding
+    append_curve(
+        tracks,
+        target,
+        bone_name,
+        {
+            "time": time,
+            "value": sample_list[curve_idx],
+            "inSlope": 0,
+            "outSlope": 0,
+            "coeff": None,
+        },
+    )
 
 
 def restore_unity_object_to_motion3(unity_object) -> Tuple | None:
@@ -255,6 +275,7 @@ def restore_unity_object_to_motion3(unity_object) -> Tuple | None:
         "TrackList": [],
         "Events": [],
     }
+    tracks: Dict[str, Dict] = {}
 
     assert (
         name == animation_clip.m_Name
@@ -272,12 +293,13 @@ def restore_unity_object_to_motion3(unity_object) -> Tuple | None:
     clip_binding_constant = animation_clip.m_ClipBindingConstant
     if not clip_binding_constant:
         raise RuntimeError(f"Failed to read clip binding constant {asset_name}")
+    binding_map = build_binding_map(clip_binding_constant)
 
     # Fill streamed frames
     for frame in streamed_frames:
         time = frame["time"]
         for curve_key in frame["keyList"]:
-            read_streamed_data(motion, clip_binding_constant, time, curve_key)
+            read_streamed_data(tracks, binding_map, time, curve_key)
 
     # Read dense clip
     dense_clip = animation_clip.m_MuscleClip.m_Clip.data.m_DenseClip
@@ -290,8 +312,8 @@ def restore_unity_object_to_motion3(unity_object) -> Tuple | None:
         for curve_idx in range(dense_clip.m_CurveCount):
             idx = stream_count + curve_idx
             read_curve_data(
-                motion,
-                clip_binding_constant,
+                tracks,
+                binding_map,
                 idx,
                 time,
                 dense_clip.m_SampleArray,
@@ -308,13 +330,19 @@ def restore_unity_object_to_motion3(unity_object) -> Tuple | None:
         for curve_idx in range(len(constant_clip.data)):
             idx = stream_count + dense_count + curve_idx
             read_curve_data(
-                motion, clip_binding_constant, idx, time2, constant_clip.data, curve_idx
+                tracks,
+                binding_map,
+                idx,
+                time2,
+                constant_clip.data,
+                curve_idx,
             )
         time2 = animation_clip.m_MuscleClip.m_StopTime
 
     # Fill events
     for ev in animation_clip.m_Events:
         motion["Events"].append({"time": ev.time, "value": ev.data})
+    motion["TrackList"] = list(tracks.values())
 
     # Base motion3 structure
     restored_motion3 = {
@@ -483,6 +511,9 @@ async def restore_live2d_motions(
     local_live2d_motion_extracted_dir: Path,
     local_live2d_model_extracted_dir: Path,
     unity_version: str,
+    changed_motion_bundle_names: set[str] | None = None,
+    param_id_cache_path: Path | None = None,
+    rebuild_param_id_cache: bool = False,
 ):
     UnityPy.config.FALLBACK_UNITY_VERSION = unity_version
 
@@ -495,16 +526,55 @@ async def restore_live2d_motions(
             f"Model extracted dir {local_live2d_model_extracted_dir} does not exist"
         )
 
-    # Gather param ID map
-    param_id_map: Dict[str, str] = {}
-    async for moc3_path in local_live2d_model_extracted_dir.glob("**/*.moc3"):
-        async with await open_file(moc3_path, "rb") as f:
-            moc3 = await f.read()
-            param_id_map.update(extract_params_ids_from_moc3(moc3))
+    # Cache the param-id map because motion-only updates do not need a full rescan.
+    param_id_map: Dict[str, str] | None = None
+    if (
+        not rebuild_param_id_cache
+        and param_id_cache_path is not None
+        and await param_id_cache_path.exists()
+    ):
+        try:
+            async with await open_file(param_id_cache_path, "rb") as f:
+                param_id_map = json.loads(await f.read())
+        except (OSError, ValueError):
+            logger.warning("Failed to load param id cache, rebuilding", exc_info=True)
+
+    if param_id_map is None:
+        param_id_map = {}
+        async for moc3_path in local_live2d_model_extracted_dir.glob("**/*.moc3"):
+            async with await open_file(moc3_path, "rb") as f:
+                moc3 = await f.read()
+            try:
+                param_id_map.update(extract_params_ids_from_moc3(moc3))
+            except (ValueError, TypeError, OSError, struct.error):
+                logger.warning("Failed to parse moc3 %s, skipping", moc3_path)
+
+        if param_id_cache_path is not None:
+            await param_id_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            async with await open_file(param_id_cache_path, "wb") as f:
+                await f.write(json.dumps(param_id_map, option=json.OPT_INDENT_2))
+
     logger.debug("Param ID map: %s", param_id_map)
 
+    if changed_motion_bundle_names is None:
+        motion_bundle_paths = [
+            motion_base_bundle_path
+            async for motion_base_bundle_path in local_live2d_motion_bundle_cache_dir.glob("*")
+        ]
+    else:
+        motion_bundle_paths = []
+        for bundle_name in sorted(changed_motion_bundle_names):
+            motion_base_bundle_path = local_live2d_motion_bundle_cache_dir / bundle_name
+            if await motion_base_bundle_path.exists():
+                motion_bundle_paths.append(motion_base_bundle_path)
+            else:
+                logger.warning(
+                    "Changed motion bundle %s not found in cache",
+                    motion_base_bundle_path,
+                )
+
     # Process all motion bundles
-    async for motion_base_bundle_path in local_live2d_motion_bundle_cache_dir.glob("*"):
+    for motion_base_bundle_path in motion_bundle_paths:
         montion_base = UnityPy.load(motion_base_bundle_path.as_posix())
         if not montion_base:
             raise RuntimeError(
@@ -513,7 +583,7 @@ async def restore_live2d_motions(
 
         container_items = montion_base.container.items()
         # Find the buildmotiondata
-        buildmotiondata_path, buildmotiondata = next(
+        buildmotiondata_entry = next(
             (
                 (i[0], i[1].read())
                 for i in container_items
@@ -522,6 +592,11 @@ async def restore_live2d_motions(
             ),
             None,
         )
+        if buildmotiondata_entry is None:
+            raise RuntimeError(
+                f"Failed to find buildmotiondata in {motion_base_bundle_path}"
+            )
+        buildmotiondata_path, buildmotiondata = buildmotiondata_entry
         if not buildmotiondata:
             raise RuntimeError(
                 f"Failed to find buildmotiondata in {motion_base_bundle_path}"

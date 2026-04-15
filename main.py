@@ -1,6 +1,7 @@
 import asyncio
 import orjson as json
 import logging
+from contextlib import AsyncExitStack
 from typing import Dict, List, Tuple
 
 import aiohttp
@@ -8,9 +9,9 @@ from anyio import Path, open_file
 
 from crypto import unpack
 from helpers import (
+    CookieManager,
     ensure_dir_exists,
     get_download_list,
-    refresh_cookie,
     setup_logging_queue,
 )
 from utils.live2d import restore_live2d_motions
@@ -19,7 +20,12 @@ from worker import worker
 logger = logging.getLogger("live2d")
 
 
-async def do_download(dl_list: List[Tuple], config, headers, cookie):
+async def do_download(
+    dl_list: List[Tuple],
+    config,
+    session: aiohttp.ClientSession,
+    cookie_manager: CookieManager,
+):
     # Create a semaphore to limit concurrency
     semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY)
 
@@ -29,8 +35,8 @@ async def do_download(dl_list: List[Tuple], config, headers, cookie):
                 f"download_worker-{url}",
                 (url, bundle),
                 config,
-                headers,
-                cookie=cookie,
+                session=session,
+                cookie_manager=cookie_manager,
             )
 
     # Create and gather download tasks
@@ -39,13 +45,32 @@ async def do_download(dl_list: List[Tuple], config, headers, cookie):
 
     logger.info("Download completed, restoring live2d motions...")
 
-    if len(dl_list):
+    changed_motion_bundle_names = {
+        Path(bundle["bundleName"]).name
+        for _, bundle in dl_list
+        if bundle.get("bundleName", "").startswith("live2d/motion/")
+    }
+    model_bundles_changed = any(
+        bundle.get("bundleName", "").startswith("live2d/model/")
+        for _, bundle in dl_list
+    )
+
+    if changed_motion_bundle_names or model_bundles_changed:
         await restore_live2d_motions(
             config.ASSET_LOCAL_BUNDLE_CACHE_DIR / "live2d" / "motion",
             config.ASSET_LOCAL_EXTRACTED_DIR / "live2d" / "motion",
             config.ASSET_LOCAL_EXTRACTED_DIR / "live2d" / "model",
             config.UNITY_VERSION,
+            changed_motion_bundle_names=(
+                None if model_bundles_changed else changed_motion_bundle_names
+            ),
+            param_id_cache_path=(
+                config.ASSET_LOCAL_EXTRACTED_DIR / "live2d" / "param_id_map.json"
+            ),
+            rebuild_param_id_cache=model_bundles_changed,
         )
+    else:
+        logger.info("No motion-related bundles changed, skipping motion restore")
 
     logger.info("Restoring completed, generating model list...")
     
@@ -127,29 +152,42 @@ async def main():
         "X-Unity-Version": config.UNITY_VERSION,
     }
 
-    cookie = None
-    # Cookie must be filled if GAME_COOKIE_URL is set in the config
-    if config.GAME_COOKIE_URL:
-        headers, cookie = await refresh_cookie(config, headers)
-
-    if await config.DL_LIST_CACHE_PATH.exists():
-        logger.info(
-            "Cache file %s exists, loading from cache", config.DL_LIST_CACHE_PATH
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300)
+    # noinspection PyAbstractClass
+    async with AsyncExitStack() as stack:
+        session = await stack.enter_async_context(
+            aiohttp.ClientSession(timeout=timeout)
         )
-        # Load the dl_list from the cache and start downloading
-        async with await open_file(config.DL_LIST_CACHE_PATH, "r") as f:
-            dl_list = json.loads(await f.read())
-            logger.info("%d items to download", len(dl_list))
-            await do_download(dl_list, config=config, headers=headers, cookie=cookie)
+        proxy_session = session
+        if config.PROXY_URL:
+            proxy_session = await stack.enter_async_context(
+                aiohttp.ClientSession(timeout=timeout, proxy=config.PROXY_URL)
+            )
 
-        # remove the cache file
-        await config.DL_LIST_CACHE_PATH.unlink()
-        return
+        cookie_manager = CookieManager(config, session, headers)
 
-    game_version_json = None
-    # Download, parse and cache the game version json from GAME_VERSION_JSON_URL
-    if config.GAME_VERSION_JSON_URL:
-        async with aiohttp.ClientSession() as session:
+        if await config.DL_LIST_CACHE_PATH.exists():
+            logger.info(
+                "Cache file %s exists, loading from cache", config.DL_LIST_CACHE_PATH
+            )
+            # Load the dl_list from the cache and start downloading
+            async with await open_file(config.DL_LIST_CACHE_PATH, "r") as f:
+                dl_list = json.loads(await f.read())
+                logger.info("%d items to download", len(dl_list))
+                await do_download(
+                    dl_list,
+                    config=config,
+                    session=session,
+                    cookie_manager=cookie_manager,
+                )
+
+            # remove the cache file
+            await config.DL_LIST_CACHE_PATH.unlink()
+            return
+
+        game_version_json = None
+        # Download, parse and cache the game version json from GAME_VERSION_JSON_URL
+        if config.GAME_VERSION_JSON_URL:
             async with session.get(config.GAME_VERSION_JSON_URL) as response:
                 if response.status == 200:
                     game_version_json = await response.json(content_type="text/plain")
@@ -166,22 +204,25 @@ async def main():
                     raise Exception(
                         f"Failed to fetch game version json from {config.GAME_VERSION_JSON_URL}"
                     )
-    else:
-        raise Exception("GAME_VERSION_JSON_URL is not set in the config")
-    logger.debug(
-        f"Current appVersion: {game_version_json['appVersion']}, dataVersion: {game_version_json['dataVersion']}, assetVersion: {game_version_json['assetVersion']}"
-    )
-
-    assetbundle_host_hash = None
-    # Format GAME_VERSION_URL using the appVersion and appHash from the game version json
-    if config.GAME_VERSION_URL:
-        game_version_url = config.GAME_VERSION_URL.format(
-            appVersion=game_version_json["appVersion"],
-            appHash=game_version_json["appHash"],
+        else:
+            raise Exception("GAME_VERSION_JSON_URL is not set in the config")
+        logger.debug(
+            f"Current appVersion: {game_version_json['appVersion']}, dataVersion: {game_version_json['dataVersion']}, assetVersion: {game_version_json['assetVersion']}"
         )
-        # This request needs to be proxied
-        async with aiohttp.ClientSession(proxy=config.PROXY_URL) as session:
-            async with session.get(game_version_url, headers=headers) as response:
+
+        request_headers = await cookie_manager.get_headers()
+
+        assetbundle_host_hash = None
+        # Format GAME_VERSION_URL using the appVersion and appHash from the game version json
+        if config.GAME_VERSION_URL:
+            game_version_url = config.GAME_VERSION_URL.format(
+                appVersion=game_version_json["appVersion"],
+                appHash=game_version_json["appHash"],
+            )
+            async with proxy_session.get(
+                game_version_url,
+                headers=request_headers,
+            ) as response:
                 if response.status == 200:
                     result = await response.read()
                     json_result = unpack(config.AES_KEY, config.AES_IV, result)
@@ -196,22 +237,25 @@ async def main():
                     raise Exception(
                         f"Failed to fetch assetbundle host hash from {game_version_url}"
                     )
-    else:
-        raise Exception("GAME_VERSION_URL is not set in the config")
-    logger.debug(
-        f"Current assetbundleHostHash: {assetbundle_host_hash}, assetHash: {game_version_json['assetHash']}"
-    )
-
-    asset_bundle_info = None
-    # Format ASSET_BUNDLE_INFO_URL using the information above
-    if config.ASSET_BUNDLE_INFO_URL:
-        asset_bundle_info_url = config.ASSET_BUNDLE_INFO_URL.format(
-            assetbundleHostHash=assetbundle_host_hash,
-            assetVersion=game_version_json["assetVersion"],
-            assetHash=game_version_json["assetHash"],
+        else:
+            raise Exception("GAME_VERSION_URL is not set in the config")
+        logger.debug(
+            f"Current assetbundleHostHash: {assetbundle_host_hash}, assetHash: {game_version_json['assetHash']}"
         )
-        async with aiohttp.ClientSession() as session:
-            async with session.get(asset_bundle_info_url, headers=headers) as response:
+
+        asset_bundle_info = None
+        # Format ASSET_BUNDLE_INFO_URL using the information above
+        if config.ASSET_BUNDLE_INFO_URL:
+            asset_bundle_info_url = config.ASSET_BUNDLE_INFO_URL.format(
+                assetbundleHostHash=assetbundle_host_hash,
+                assetVersion=game_version_json["assetVersion"],
+                assetHash=game_version_json["assetHash"],
+            )
+            request_headers = await cookie_manager.get_headers()
+            async with session.get(
+                asset_bundle_info_url,
+                headers=request_headers,
+            ) as response:
                 if response.status == 200:
                     result = await response.read()
                     asset_bundle_info = unpack(config.AES_KEY, config.AES_IV, result)
@@ -222,26 +266,31 @@ async def main():
                     raise Exception(
                         f"Failed to fetch asset bundle info from {asset_bundle_info_url}"
                     )
-    else:
-        raise Exception("ASSET_BUNDLE_INFO_URL is not set in the config")
-    logger.debug(
-        f"Current assetBundleInfoVersion: {asset_bundle_info['version']}, bundles length: {len(asset_bundle_info['bundles'])}"
-    )
+        else:
+            raise Exception("ASSET_BUNDLE_INFO_URL is not set in the config")
+        logger.debug(
+            f"Current assetBundleInfoVersion: {asset_bundle_info['version']}, bundles length: {len(asset_bundle_info['bundles'])}"
+        )
 
-    # Generate the download list
-    download_list = await get_download_list(
-        asset_bundle_info,
-        game_version_json,
-        config=config,
-        assetbundle_host_hash=assetbundle_host_hash,
-    )
-    logger.info("Download list generated, %d items to download", len(download_list))
+        # Generate the download list
+        download_list = await get_download_list(
+            asset_bundle_info,
+            game_version_json,
+            config=config,
+            assetbundle_host_hash=assetbundle_host_hash,
+        )
+        logger.info("Download list generated, %d items to download", len(download_list))
 
-    await do_download(download_list, config=config, headers=headers, cookie=cookie)
+        await do_download(
+            download_list,
+            config=config,
+            session=session,
+            cookie_manager=cookie_manager,
+        )
 
-    # remove the cached download list
-    if await config.DL_LIST_CACHE_PATH.exists():
-        await config.DL_LIST_CACHE_PATH.unlink()
+        # remove the cached download list
+        if await config.DL_LIST_CACHE_PATH.exists():
+            await config.DL_LIST_CACHE_PATH.unlink()
 
 
 def cli():

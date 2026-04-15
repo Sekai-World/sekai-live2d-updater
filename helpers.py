@@ -157,35 +157,126 @@ async def get_download_list(
     return download_list
 
 
+def get_cookie_expire_time(cookie: str | None) -> int | None:
+    """Extract the expiration timestamp from a cloudfront cookie."""
+    if not cookie:
+        return None
+
+    try:
+        cookie_payload = cookie.split(";", 1)[0].split("=", 1)[1]
+        return json.loads(
+            base64.b64decode(cookie_payload + "=").decode("utf-8")
+        )["Statement"][0]["Condition"]["DateLessThan"]["AWS:EpochTime"]
+    except (
+        IndexError,
+        KeyError,
+        TypeError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ):
+        logger.warning("Failed to parse cookie expiration, forcing refresh")
+        return None
+
+
+class CookieManager:
+    def __init__(
+        self,
+        config,
+        session: aiohttp.ClientSession,
+        base_headers: Dict[str, str],
+        cookie: str | None = None,
+    ) -> None:
+        self._config = config
+        self._session = session
+        self._base_headers = dict(base_headers)
+        self._cookie = cookie
+        self._cookie_expire_time = get_cookie_expire_time(cookie)
+        self._lock = asyncio.Lock()
+
+    def _has_valid_cookie(self) -> bool:
+        return (
+            self._cookie is not None
+            and self._cookie_expire_time is not None
+            and self._cookie_expire_time > int(time.time()) + 3600
+        )
+
+    async def get_cookie(self) -> str | None:
+        if not self._config.GAME_COOKIE_URL:
+            return None
+
+        if self._has_valid_cookie():
+            return self._cookie
+
+        async with self._lock:
+            if self._has_valid_cookie():
+                return self._cookie
+
+            async with self._session.post(
+                self._config.GAME_COOKIE_URL,
+                headers=self._base_headers,
+            ) as response:
+                if response.status != 200:
+                    raise RuntimeError(
+                        f"Failed to fetch cookie from {self._config.GAME_COOKIE_URL}"
+                    )
+
+                self._cookie = response.headers.get("Set-Cookie")
+                if not self._cookie:
+                    raise RuntimeError(
+                        f"Missing Set-Cookie from {self._config.GAME_COOKIE_URL}"
+                    )
+
+                self._cookie_expire_time = get_cookie_expire_time(self._cookie)
+
+        return self._cookie
+
+    async def get_headers(self) -> Dict[str, str]:
+        headers = dict(self._base_headers)
+        cookie = await self.get_cookie()
+        if cookie:
+            headers["Cookie"] = cookie
+        return headers
+
+
 async def refresh_cookie(
-    config, headers: Dict[str, str], cookie: str = None
+    config,
+    headers: Dict[str, str],
+    cookie: str = None,
+    session: aiohttp.ClientSession | None = None,
 ) -> Tuple[Dict[str, str], str]:
     """Refresh the cookie using the GAME_COOKIE_URL."""
-    if cookie:
-        # Extract the expire time from the cookie
-        cookie_expire_time = json.loads(
-            base64.b64decode(cookie.split(";")[0].split("=")[1] + "=").decode("utf-8")
-        )["Statement"][0]["Condition"]["DateLessThan"]["AWS:EpochTime"]
-        # Check if the cookie is expired
-        if cookie_expire_time > int(time.time()) + 3600:
-            return headers, cookie
+    headers = dict(headers)
+    headers.pop("Cookie", None)
+
+    cookie_expire_time = get_cookie_expire_time(cookie)
+    if cookie_expire_time and cookie_expire_time > int(time.time()) + 3600:
+        headers["Cookie"] = cookie
+        return headers, cookie
 
     # If the cookie is expired or not set, fetch a new one
-    if config.GAME_COOKIE_URL:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                config.GAME_COOKIE_URL, headers=headers
-            ) as response:
-                if response.status == 200:
-                    cookie = response.headers.get("Set-Cookie")
-                    headers["Cookie"] = cookie
-                else:
-                    raise RuntimeError(
-                        f"Failed to fetch cookie from {config.GAME_COOKIE_URL}"
-                    )
-    else:
+    if not config.GAME_COOKIE_URL:
         raise ValueError("GAME_COOKIE_URL is not set in the config")
 
+    if session is None:
+        async with aiohttp.ClientSession() as owned_session:
+            return await refresh_cookie(
+                config,
+                headers,
+                cookie=cookie,
+                session=owned_session,
+            )
+
+    async with session.post(config.GAME_COOKIE_URL, headers=headers) as response:
+        if response.status != 200:
+            raise RuntimeError(
+                f"Failed to fetch cookie from {config.GAME_COOKIE_URL}"
+            )
+        cookie = response.headers.get("Set-Cookie")
+        if not cookie:
+            raise RuntimeError(f"Missing Set-Cookie from {config.GAME_COOKIE_URL}")
+
+    headers["Cookie"] = cookie
     return headers, cookie
 
 
