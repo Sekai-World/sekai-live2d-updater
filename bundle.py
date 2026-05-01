@@ -2,6 +2,7 @@
 
 import orjson as json
 import logging
+import asyncio
 from typing import Dict, List, Tuple
 
 import aiohttp
@@ -14,7 +15,7 @@ from UnityPy.export.SpriteHelper import SpriteSettings, get_image
 from anyio import Path, open_file
 
 from constants import UNITY_FS_CONTAINER_BASE
-from helpers import deobfuscate
+from helpers import deobfuscate, get_download_max_retries, get_request_timeout
 from utils.live2d import (
     correct_param_ids,
     extract_params_ids_from_moc3,
@@ -98,22 +99,47 @@ def _render_image_asset(
 
 
 async def download_deobfuscate_bundle(
-    url: str, bundle_save_path: Path, headers: Dict[str, str]
-) -> Tuple[str, Dict]:
+    url: str,
+    bundle_save_path: Path,
+    headers: Dict[str, str],
+    config=None,
+    session: aiohttp.ClientSession | None = None,
+) -> None:
     """Download and deobfuscate the bundle."""
-    # Download the bundle
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as response:
-            if response.status == 200:
-                # Read the response data
-                data = await response.read()
-                # Deobfuscate the data
-                deobfuscated_data = await deobfuscate(data)
-                # Save the deobfuscated data to the file
-                async with await open_file(bundle_save_path, "wb") as f:
-                    await f.write(deobfuscated_data)
-            else:
-                raise aiohttp.ClientError(f"Failed to download {url}")
+    max_retries = get_download_max_retries(config)
+    timeout = get_request_timeout(config)
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            _session = session or aiohttp.ClientSession(timeout=timeout)
+            _owns_session = session is None
+            try:
+                async with _session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.read()
+                        deobfuscated_data = await deobfuscate(data)
+                        async with await open_file(bundle_save_path, "wb") as f:
+                            await f.write(deobfuscated_data)
+                        return
+                    else:
+                        raise aiohttp.ClientError(f"Failed to download {url}: status {response.status}")
+            finally:
+                if _owns_session:
+                    await _session.close()
+        except (
+            asyncio.TimeoutError,
+            aiohttp.ServerDisconnectedError,
+            aiohttp.ClientPayloadError,
+        ) as exc:
+            last_exc = exc
+            logger.warning(
+                "Download attempt %d/%d failed for %s: %s",
+                attempt + 1, max_retries, url, exc,
+            )
+            continue
+    raise RuntimeError(
+        f"Failed to download {url} after {max_retries} attempts"
+    ) from last_exc
 
 
 async def extract_asset_bundle(
@@ -142,6 +168,9 @@ async def extract_asset_bundle(
     Returns:
         List[Path]: _description_
     """
+    if bundle.get("bundleName", "").startswith("live2d/motion"):
+        return []
+
     UnityPy.config.FALLBACK_UNITY_VERSION = unity_version
 
     # Load the bundle

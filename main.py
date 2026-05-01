@@ -8,34 +8,33 @@ from anyio import Path, open_file
 
 from crypto import unpack
 from helpers import (
+    build_download_disk_space_gate,
     ensure_dir_exists,
     get_download_list,
     refresh_cookie,
     setup_logging_queue,
 )
 from utils.live2d import restore_live2d_motions
-from worker import worker
+from worker import run_pipeline
 
 logger = logging.getLogger("live2d")
 
 
 async def do_download(dl_list: List[Tuple], config, headers, cookie):
-    # Create a semaphore to limit concurrency
-    semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY)
-
-    async def download_task(url, bundle):
-        async with semaphore:
-            await worker(
-                f"download_worker-{url}",
-                (url, bundle),
-                config,
-                headers,
-                cookie=cookie,
-            )
-
-    # Create and gather download tasks
-    tasks = [download_task(url, bundle) for url, bundle in dl_list]
-    await asyncio.gather(*tasks)
+    logger.info("RUN | step=4/4 | action=pipeline_start | items=%d", len(dl_list))
+    download_disk_space_gate = build_download_disk_space_gate(config)
+    try:
+        failed_tasks = await run_pipeline(
+            dl_list, config, headers, cookie=cookie,
+            download_disk_space_gate=download_disk_space_gate,
+        )
+    except Exception:
+        logger.exception("ERROR | stage=pipeline | action=crash | items=%d", len(dl_list))
+        failed_tasks = dl_list
+    if failed_tasks:
+        async with await open_file(config.DL_LIST_CACHE_PATH, "wb") as f:
+            await f.write(json.dumps(failed_tasks, option=json.OPT_INDENT_2))
+        logger.warning("RUN | result=partial_failure | failed=%d", len(failed_tasks))
 
     logger.info("Download completed, restoring live2d motions...")
 
