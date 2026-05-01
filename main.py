@@ -1,6 +1,7 @@
 import asyncio
 import orjson as json
 import logging
+import time
 from typing import Dict, List, Tuple
 
 import aiohttp
@@ -35,6 +36,8 @@ async def do_download(dl_list: List[Tuple], config, headers, cookie):
         async with await open_file(config.DL_LIST_CACHE_PATH, "wb") as f:
             await f.write(json.dumps(failed_tasks, option=json.OPT_INDENT_2))
         logger.warning("RUN | result=partial_failure | failed=%d", len(failed_tasks))
+    else:
+        logger.info("RUN | result=success | processed=%d", len(dl_list))
 
     logger.info("Download completed, restoring live2d motions...")
 
@@ -275,14 +278,35 @@ def cli():
 
     # Set the logging level
     if args.verbose:
-        logging.basicConfig(level=logging.DEBUG)
+        log_level = logging.DEBUG
     else:
-        logging.basicConfig(level=logging.INFO)
+        log_level = logging.INFO
+
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
 
     setup_logging_queue()
+    region_name = getattr(getattr(config, "REGION", None), "name", "unknown")
+    logger.info(
+        "RUN | action=start | config=%s | region=%s | verbose=%s",
+        args.config,
+        region_name,
+        args.verbose,
+    )
 
     # Run the main function
-    asyncio.run(main())
+    start_time = time.perf_counter()
+    try:
+        asyncio.run(main())
+    finally:
+        logger.info(
+            "RUN | action=completed | duration_sec=%.2f",
+            time.perf_counter() - start_time,
+        )
 
 
 if __name__ == "__main__":

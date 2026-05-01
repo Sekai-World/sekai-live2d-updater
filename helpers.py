@@ -18,6 +18,7 @@ import orjson as json
 from anyio import Path, open_file
 
 logger = logging.getLogger("live2d")
+_LOG_QUEUE_LISTENER: QueueListener | None = None
 
 DEFAULT_REQUEST_TIMEOUT = 30 * 60
 DEFAULT_DOWNLOAD_MAX_RETRIES = 3
@@ -44,6 +45,10 @@ def setup_logging_queue() -> None:
     handlers.
 
     """
+    global _LOG_QUEUE_LISTENER
+    if _LOG_QUEUE_LISTENER is not None:
+        return
+
     queue = SimpleQueue()
     root = logging.getLogger()
 
@@ -58,6 +63,7 @@ def setup_logging_queue() -> None:
 
     listener = QueueListener(queue, *handlers, respect_handler_level=True)
     listener.start()
+    _LOG_QUEUE_LISTENER = listener
 
 
 async def ensure_dir_exists(dir_path: Path):
