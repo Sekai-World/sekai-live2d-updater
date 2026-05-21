@@ -344,7 +344,11 @@ async def get_download_list(
     asset_bundle_info: Dict,
     game_version_json: Dict,
     config=None,
+    assetver: str = None,
     assetbundle_host_hash: str = None,
+    include_list: List[str] = None,
+    exclude_list: List[str] = None,
+    priority_list: List[str] = None,
 ) -> List[Tuple[str, Dict]]:
     """Generate the download list for the live2d asset bundles.
 
@@ -370,57 +374,131 @@ async def get_download_list(
 
     version = asset_bundle_info.get("version", "")
     asset_hash: str = game_version_json.get("assetHash", "")
-    asset_bundle_url_args: Dict[str, str] = {
-        "assetbundleHostHash": assetbundle_host_hash,
-        "version": version,
-    }
-    if asset_hash:
-        asset_bundle_url_args["assetHash"] = asset_hash
+    app_version: str = (
+        getattr(config, "APP_VERSION_OVERRIDE", None)
+        or game_version_json.get("appVersion")
+        or ""
+    )
 
-    download_list = None
+    download_list = []
     if cached_asset_bundle_info and cached_game_version_json:
-        # Colorful Palette servers — only download bundles that changed
         cached_bundles: Dict = cached_asset_bundle_info.get("bundles", {})
         current_bundles: Dict = asset_bundle_info.get("bundles", {})
 
-        changed_bundles = [
-            bundle
-            for bundle in current_bundles.values()
-            if bundle_has_changed(
-                bundle,
-                cached_bundles.get(bundle.get("bundleName", ""), {}),
-            )
-            and bundle.get("bundleName", "").startswith("live2d/")
-        ]
+        if assetver:
+            cached_assetver = cached_game_version_json.get("assetver", None)
+            if cached_assetver != assetver:
+                game_version_json["assetver"] = assetver
+                changed_bundles = [
+                    bundle
+                    for bundle in current_bundles.values()
+                    if bundle_has_changed(
+                        bundle,
+                        cached_bundles.get(bundle.get("bundleName", ""), {}),
+                    )
+                    and bundle.get("bundleName", "").startswith("live2d/")
+                ]
+                download_list = [
+                    (
+                        format_url_template(
+                            config.ASSET_BUNDLE_URL,
+                            appVersion=app_version,
+                            bundleName=bundle.get("bundleName"),
+                            downloadPath=bundle.get("downloadPath"),
+                        ),
+                        bundle,
+                    )
+                    for bundle in changed_bundles
+                ]
+        else:
+            asset_bundle_url_args: Dict[str, str] = {
+                "assetbundleHostHash": assetbundle_host_hash,
+                "version": version,
+            }
+            if asset_hash:
+                asset_bundle_url_args["assetHash"] = asset_hash
 
-        download_list = [
-            (
-                format_url_template(
-                    config.ASSET_BUNDLE_URL,
-                    **asset_bundle_url_args,
-                    bundleName=bundle.get("bundleName"),
-                ),
-                bundle,
-            )
-            for bundle in changed_bundles
-        ]
+            changed_bundles = [
+                bundle
+                for bundle in current_bundles.values()
+                if bundle_has_changed(
+                    bundle,
+                    cached_bundles.get(bundle.get("bundleName", ""), {}),
+                )
+                and bundle.get("bundleName", "").startswith("live2d/")
+            ]
+
+            download_list = [
+                (
+                    format_url_template(
+                        config.ASSET_BUNDLE_URL,
+                        **asset_bundle_url_args,
+                        bundleName=bundle.get("bundleName"),
+                    ),
+                    bundle,
+                )
+                for bundle in changed_bundles
+            ]
 
     else:
-        # Full download
         bundles: Dict = asset_bundle_info.get("bundles", {})
+        if assetver:
+            game_version_json["assetver"] = assetver
+            download_list = [
+                (
+                    format_url_template(
+                        config.ASSET_BUNDLE_URL,
+                        appVersion=app_version,
+                        bundleName=bundle.get("bundleName"),
+                        downloadPath=bundle.get("downloadPath"),
+                    ),
+                    bundle,
+                )
+                for bundle in bundles.values()
+                if bundle.get("bundleName", "").startswith("live2d/")
+            ]
+        else:
+            asset_bundle_url_args: Dict[str, str] = {
+                "assetbundleHostHash": assetbundle_host_hash,
+                "version": version,
+            }
+            if asset_hash:
+                asset_bundle_url_args["assetHash"] = asset_hash
+            download_list = [
+                (
+                    format_url_template(
+                        config.ASSET_BUNDLE_URL,
+                        **asset_bundle_url_args,
+                        bundleName=bundle.get("bundleName"),
+                    ),
+                    bundle,
+                )
+                for bundle in bundles.values()
+                if bundle.get("bundleName", "").startswith("live2d/")
+            ]
 
-        download_list = [
-            (
-                format_url_template(
-                    config.ASSET_BUNDLE_URL,
-                    **asset_bundle_url_args,
-                    bundleName=bundle.get("bundleName"),
-                ),
-                bundle,
+    logger.debug("Download list length: %s", len(download_list) if download_list else 0)
+    if download_list:
+        if include_list:
+            download_list = [
+                item for item in download_list
+                if any(re.match(t, item[1].get("bundleName")) for t in include_list)
+            ]
+        if exclude_list:
+            download_list = [
+                item for item in download_list
+                if not any(re.match(t, item[1].get("bundleName")) for t in exclude_list)
+            ]
+        download_list = sorted(download_list, key=lambda item: item[1].get("bundleName"))
+        if priority_list:
+            download_list = sorted(
+                download_list,
+                key=lambda item: [
+                    i for i, t in enumerate(priority_list)
+                    if re.match(t, item[1].get("bundleName"))
+                ],
             )
-            for bundle in bundles.values()
-            if bundle.get("bundleName", "").startswith("live2d/")
-        ]
+    logger.debug("Download list length after filter: %s", len(download_list) if download_list else 0)
 
     # Cache the download list
     if download_list:

@@ -30,10 +30,13 @@ GAME_VERSION_JSON_URL = None
 GAME_COOKIE_URL = None
 # URL for fetching in-game version information
 GAME_VERSION_URL = None
+# URL for fetching asset version
+ASSET_VER_URL = None
 # URL for fetching asset bundle info
 ASSET_BUNDLE_INFO_URL = None
 # URL for downloading asset bundle
 ASSET_BUNDLE_URL = None
+APP_VERSION_OVERRIDE = None
 
 # Cache information for downloading, must set!
 DL_LIST_CACHE_PATH = Path("cache", "jp", "json", "dl_list.json")
@@ -53,3 +56,9 @@ ASSET_REMOTE_STORAGE = [
         "args": ["copy", "src", "dst"]
     },
 ]
+
+DL_INCLUDE_LIST = [
+    r"^live2d/.*"
+]
+DL_EXCLUDE_LIST = None
+DL_PRIORITY_LIST = None
