@@ -14,9 +14,24 @@ REGION = SekaiServerRegion.JP
 UNITY_VERSION = "2022.3.21f1"
 # User agent for requests, replace with the correct user agent if needed
 USER_AGENT = None
+# HTTP request timeout in seconds; set to 0 or None to disable
+REQUEST_TIMEOUT = 180
+# Number of download retry attempts on timeout or connection errors
+DOWNLOAD_MAX_RETRIES = 3
+# Minimum free bytes to keep on the download filesystem before starting a new download
+MIN_FREE_DISK_BYTES = 1024 * 1024 * 1024
+# How often blocked downloads recheck free disk space
+DOWNLOAD_DISK_SPACE_CHECK_INTERVAL = 5
 
 # Concurrency settings, default to the number of CPU cores
 MAX_CONCURRENCY = os.cpu_count()
+# Pipeline stage concurrency. Defaults preserve the previous MAX_CONCURRENCY behavior
+# for download/extract while upload uses one bundle-level worker.
+MAX_CONCURRENCY_DOWNLOADS = MAX_CONCURRENCY
+MAX_CONCURRENCY_EXTRACTS = MAX_CONCURRENCY
+MAX_CONCURRENCY_UPLOAD_STAGE = 1
+# Maximum queued artifacts between stages.
+PIPELINE_STAGE_QUEUE_SIZE = MAX_CONCURRENCY
 # Maximum number of concurrent uploads
 MAX_CONCURRENCY_UPLOADS = 10
 
