@@ -1,19 +1,17 @@
 import asyncio
-import orjson as json
 import logging
 import time
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import aiohttp
+import orjson as json
 from anyio import Path, open_file
 
-from constants import NUVERSE_REGIONS
-from crypto import unpack
+from asset_bundle_info import build_request_headers, fetch_asset_bundle_info
 from helpers import (
     build_download_disk_space_gate,
     ensure_dir_exists,
+    filter_bundles,
     get_download_list,
-    refresh_cookie,
     setup_logging_queue,
 )
 from utils.live2d import restore_live2d_motions
@@ -21,24 +19,55 @@ from worker import run_pipeline
 
 logger = logging.getLogger("live2d")
 
+DownloadItem = Tuple[str, Dict[str, Any]]
+config: Optional[Any] = None
 
-async def do_download(dl_list: List[Tuple], config, headers, cookie):
+
+def require_config():
+    if config is None:
+        raise ImportError(
+            "Config module not loaded. Please run the script with the config argument."
+        )
+    return config
+
+
+async def do_download(dl_list: List[DownloadItem], config, headers, cookie) -> bool:
     logger.info("RUN | step=4/4 | action=pipeline_start | items=%d", len(dl_list))
     download_disk_space_gate = build_download_disk_space_gate(config)
+    if download_disk_space_gate is not None:
+        logger.debug(
+            "Download disk space gate enabled for %s with min free bytes=%d",
+            download_disk_space_gate.target_path,
+            download_disk_space_gate.min_free_bytes,
+        )
+
     try:
         failed_tasks = await run_pipeline(
-            dl_list, config, headers, cookie=cookie,
+            dl_list,
+            config,
+            headers,
+            cookie=cookie,
             download_disk_space_gate=download_disk_space_gate,
         )
     except Exception:
-        logger.exception("ERROR | stage=pipeline | action=crash | items=%d", len(dl_list))
+        logger.exception(
+            "ERROR | stage=pipeline | action=crash | preserve_pending=true | items=%d",
+            len(dl_list),
+        )
         failed_tasks = dl_list
+
     if failed_tasks:
-        async with await open_file(config.DL_LIST_CACHE_PATH, "wb") as f:
+        failed_path = config.DL_LIST_CACHE_PATH
+        async with await open_file(failed_path, "wb") as f:
             await f.write(json.dumps(failed_tasks, option=json.OPT_INDENT_2))
-        logger.warning("RUN | result=partial_failure | failed=%d", len(failed_tasks))
+        logger.warning(
+            "RUN | result=partial_failure | failed=%d | retry_list=%s",
+            len(failed_tasks),
+            failed_path,
+        )
+        return False
     else:
-        logger.info("RUN | result=success | processed=%d", len(dl_list))
+        logger.info("RUN | result=success | completed=%d", len(dl_list))
 
     logger.info("Download completed, restoring live2d motions...")
 
@@ -109,182 +138,167 @@ async def do_download(dl_list: List[Tuple], config, headers, cookie):
                 else:
                     logger.info("Successfully uploaded %s to %s", src_path, remote_path)
 
+    return True
 
-async def main():
-    # Check if the config module is loaded
-    if "config" not in globals():
-        raise ImportError(
-            "Config module not loaded. Please run the script with the config argument."
-        )
-    # load the config module
-    global config
 
-    # ensure required directories exist
-    await ensure_dir_exists(config.DL_LIST_CACHE_PATH.parent)
-    await ensure_dir_exists(config.ASSET_BUNDLE_INFO_CACHE_PATH.parent)
-    await ensure_dir_exists(config.GAME_VERSION_JSON_CACHE_PATH.parent)
+async def main(
+    update_asset_bundle_info_only: bool = False,
+    force_full_download: bool = False,
+):
+    cfg = require_config()
+    start_time = time.monotonic()
 
-    headers: Dict[str, str] = {
-        "Accept": "*/*",
-        "User-Agent": config.USER_AGENT,
-        "X-Unity-Version": config.UNITY_VERSION,
-    }
+    run_mode = "metadata-only" if update_asset_bundle_info_only else "full-pipeline"
+    logger.info(
+        "RUN | status=start | mode=%s | force_full_download=%s",
+        run_mode,
+        force_full_download,
+    )
 
-    cookie = None
-    # Cookie must be filled if GAME_COOKIE_URL is set in the config
-    if config.GAME_COOKIE_URL:
-        headers, cookie = await refresh_cookie(config, headers)
+    await ensure_dir_exists(cfg.DL_LIST_CACHE_PATH.parent)
+    await ensure_dir_exists(cfg.ASSET_BUNDLE_INFO_CACHE_PATH.parent)
+    await ensure_dir_exists(cfg.GAME_VERSION_JSON_CACHE_PATH.parent)
+    headers, cookie = await build_request_headers(cfg)
 
-    if await config.DL_LIST_CACHE_PATH.exists():
+    if force_full_download:
         logger.info(
-            "Cache file %s exists, loading from cache", config.DL_LIST_CACHE_PATH
+            "RUN | option=force_full_download | cache_metadata=false | cache_pending=false"
         )
-        # Load the dl_list from the cache and start downloading
-        async with await open_file(config.DL_LIST_CACHE_PATH, "r") as f:
-            dl_list = json.loads(await f.read())
-            logger.info("%d items to download", len(dl_list))
-            await do_download(dl_list, config=config, headers=headers, cookie=cookie)
 
-        # remove the cache file
-        await config.DL_LIST_CACHE_PATH.unlink()
-        return
+    logger.info("RUN | step=1/4 | action=fetch_metadata")
+    fetch_result = await fetch_asset_bundle_info(cfg, headers=headers, cookie=cookie)
+    headers = fetch_result.headers
+    cookie = fetch_result.cookie
+    game_version_json = fetch_result.game_version_json
+    asset_ver = fetch_result.asset_ver
+    assetbundle_host_hash = fetch_result.assetbundle_host_hash
+    asset_bundle_info = fetch_result.asset_bundle_info
 
-    game_version_json = None
-    # Download, parse and cache the game version json from GAME_VERSION_JSON_URL
-    if config.GAME_VERSION_JSON_URL:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(config.GAME_VERSION_JSON_URL) as response:
-                if response.status == 200:
-                    game_version_json = await response.json(content_type="text/plain")
-                    # Check if the json is valid
-                    if (
-                        not isinstance(game_version_json, dict)
-                        or "appVersion" not in game_version_json
-                        or "appHash" not in game_version_json
-                    ):
-                        raise Exception(
-                            f"Invalid json from {config.GAME_VERSION_JSON_URL}"
-                        )
-                else:
-                    raise Exception(
-                        f"Failed to fetch game version json from {config.GAME_VERSION_JSON_URL}"
-                    )
-    else:
-        raise Exception("GAME_VERSION_JSON_URL is not set in the config")
-    logger.debug(
-        f"Current appVersion: {game_version_json['appVersion']}, dataVersion: {game_version_json['dataVersion']}, assetVersion: {game_version_json['assetVersion']}"
+    logger.info(
+        "RUN | action=metadata_fetched | asset_ver=%s | bundle_count=%d",
+        asset_ver,
+        len(asset_bundle_info.get("bundles", {})),
     )
 
-    assetbundle_host_hash = None
-    # Format GAME_VERSION_URL using the appVersion and appHash from the game version json
-    if config.GAME_VERSION_URL:
-        game_version_url = config.GAME_VERSION_URL.format(
-            appVersion=game_version_json["appVersion"],
-            appHash=game_version_json["appHash"],
-        )
-        # This request needs to be proxied
-        async with aiohttp.ClientSession(proxy=config.PROXY_URL) as session:
-            async with session.get(game_version_url, headers=headers) as response:
-                if response.status == 200:
-                    result = await response.read()
-                    json_result = unpack(config.AES_KEY, config.AES_IV, result)
-                    # Check if the json is valid
-                    if (
-                        not isinstance(json_result, dict)
-                        or "assetbundleHostHash" not in json_result
-                    ):
-                        raise Exception(f"Invalid result from {game_version_url}")
-                    assetbundle_host_hash = json_result["assetbundleHostHash"]
-                else:
-                    raise Exception(
-                        f"Failed to fetch assetbundle host hash from {game_version_url}"
-                    )
-    else:
-        logger.warning(
-            "GAME_VERSION_URL is not set in the config, assuming that the assetbundleHostHash is not needed"
-        )
-    logger.debug(
-        "Current assetbundleHostHash: %s, assetHash: %s",
-        assetbundle_host_hash,
-        game_version_json["assetHash"],
-    )
+    if update_asset_bundle_info_only:
+        logger.info("RUN | step=2/2 | action=write_metadata_cache")
+        current_bundles: Dict[str, Dict] = asset_bundle_info.get("bundles", {})
+        if not current_bundles:
+            raise ValueError("bundles must be set in asset bundle info")
 
-    asset_ver = None
-    # Format ASSET_VER_URL using the appVersion from the game version json
-    if config.REGION in NUVERSE_REGIONS:
-        asset_ver_config_url = getattr(config, "ASSET_VER_URL", None)
-        if asset_ver_config_url:
-            asset_ver_url = asset_ver_config_url.format(
-                appVersion=(
-                    getattr(config, "APP_VERSION_OVERRIDE", None)
-                    or game_version_json["appVersion"]
+        current_bundles = {
+            key: value
+            for key, value in current_bundles.items()
+            if (value.get("bundleName") or "").startswith("live2d/")
+        }
+        current_bundles = await filter_bundles(
+            current_bundles,
+            include_list=getattr(cfg, "DL_INCLUDE_LIST", None),
+            exclude_list=getattr(cfg, "DL_EXCLUDE_LIST", None),
+        )
+        if not current_bundles:
+            raise ValueError("No bundles found after filtering")
+
+        async with await open_file(cfg.ASSET_BUNDLE_INFO_CACHE_PATH, "wb") as f:
+            await f.write(
+                json.dumps(
+                    {
+                        "version": asset_bundle_info.get("version", ""),
+                        "os": asset_bundle_info.get("os", ""),
+                        "bundles": current_bundles,
+                    },
+                    option=json.OPT_INDENT_2,
                 )
             )
-            async with aiohttp.ClientSession() as session:
-                async with session.get(asset_ver_url, headers=headers) as response:
-                    if response.status == 200:
-                        result = await response.read()
-                        asset_ver = result.decode()
-                    else:
-                        raise RuntimeError(
-                            f"Failed to fetch asset version from {asset_ver_url}"
-                        )
-        else:
-            raise ValueError("ASSET_VER_URL is not set in the config")
+        async with await open_file(cfg.GAME_VERSION_JSON_CACHE_PATH, "wb") as f:
+            await f.write(json.dumps(game_version_json, option=json.OPT_INDENT_2))
+        logger.info(
+            "RUN | result=metadata_updated | path=%s | filtered_bundles=%d",
+            cfg.ASSET_BUNDLE_INFO_CACHE_PATH,
+            len(current_bundles),
+        )
+        logger.info(
+            "RUN | status=completed | duration_sec=%.2f",
+            time.monotonic() - start_time,
+        )
+        return
 
-    asset_bundle_info = None
-    # Format ASSET_BUNDLE_INFO_URL using the information above
-    if config.ASSET_BUNDLE_INFO_URL:
-        if config.REGION in NUVERSE_REGIONS:
-            asset_bundle_info_url = config.ASSET_BUNDLE_INFO_URL.format(
-                appVersion=(
-                    getattr(config, "APP_VERSION_OVERRIDE", None)
-                    or game_version_json["appVersion"]
-                ),
-                assetVer=asset_ver,
-            )
-        else:
-            asset_bundle_info_url = config.ASSET_BUNDLE_INFO_URL.format(
-                assetbundleHostHash=assetbundle_host_hash,
-                assetVersion=game_version_json["assetVersion"],
-                assetHash=game_version_json["assetHash"],
-            )
-        async with aiohttp.ClientSession() as session:
-            async with session.get(asset_bundle_info_url, headers=headers) as response:
-                if response.status == 200:
-                    result = await response.read()
-                    asset_bundle_info = unpack(config.AES_KEY, config.AES_IV, result)
-                    # Check if the json is valid
-                    if not isinstance(asset_bundle_info, dict):
-                        raise Exception(f"Invalid json from {asset_bundle_info_url}")
-                else:
-                    raise Exception(
-                        f"Failed to fetch asset bundle info from {asset_bundle_info_url}"
-                    )
-    else:
-        raise Exception("ASSET_BUNDLE_INFO_URL is not set in the config")
-    logger.debug(
-        f"Current assetBundleInfoVersion: {asset_bundle_info['version']}, bundles length: {len(asset_bundle_info['bundles'])}"
-    )
-
-    # Generate the download list
-    download_list = await get_download_list(
+    logger.info("RUN | step=2/4 | action=build_download_list")
+    new_download_list: List[DownloadItem] = await get_download_list(
         asset_bundle_info,
         game_version_json,
-        config=config,
+        config=cfg,
         assetver=asset_ver,
         assetbundle_host_hash=assetbundle_host_hash,
-        include_list=getattr(config, "DL_INCLUDE_LIST", None),
-        exclude_list=getattr(config, "DL_EXCLUDE_LIST", None),
-        priority_list=getattr(config, "DL_PRIORITY_LIST", None),
+        include_list=getattr(cfg, "DL_INCLUDE_LIST", None),
+        exclude_list=getattr(cfg, "DL_EXCLUDE_LIST", None),
+        priority_list=getattr(cfg, "DL_PRIORITY_LIST", None),
+        force_full_download=force_full_download,
     )
-    logger.info("Download list generated, %d items to download", len(download_list))
+    logger.debug("New download candidates: %d item(s)", len(new_download_list))
 
-    await do_download(download_list, config=config, headers=headers, cookie=cookie)
+    pending_list: List[DownloadItem] = []
+    if (not force_full_download) and await cfg.DL_LIST_CACHE_PATH.exists():
+        async with await open_file(cfg.DL_LIST_CACHE_PATH, "r") as f:
+            pending_list = json.loads(await f.read())
+        logger.info(
+            "RUN | action=load_pending | count=%d | path=%s",
+            len(pending_list),
+            cfg.DL_LIST_CACHE_PATH,
+        )
 
-    # remove the cached download list
-    if await config.DL_LIST_CACHE_PATH.exists():
-        await config.DL_LIST_CACHE_PATH.unlink()
+    if pending_list and new_download_list:
+        pending_bundle_names = {
+            bundle.get("bundleName") for _, bundle in pending_list
+        }
+        deduped_new = [
+            item for item in new_download_list
+            if item[1].get("bundleName") not in pending_bundle_names
+        ]
+        download_list: List[DownloadItem] = pending_list + deduped_new
+        logger.info(
+            "RUN | action=merge_download_list | pending=%d | new=%d | total=%d",
+            len(pending_list),
+            len(deduped_new),
+            len(download_list),
+        )
+    elif pending_list:
+        download_list = pending_list
+        logger.info("RUN | action=retry_pending_only | count=%d", len(pending_list))
+    else:
+        download_list = new_download_list
+
+    if not download_list:
+        logger.info("RUN | result=noop | reason=no_items")
+        logger.info(
+            "RUN | status=completed | duration_sec=%.2f",
+            time.monotonic() - start_time,
+        )
+        return
+
+    logger.info("RUN | action=download_list_ready | count=%d", len(download_list))
+    logger.info("RUN | step=3/4 | action=persist_queue | path=%s", cfg.DL_LIST_CACHE_PATH)
+    async with await open_file(cfg.DL_LIST_CACHE_PATH, "wb") as f:
+        await f.write(json.dumps(download_list, option=json.OPT_INDENT_2))
+
+    is_success = await do_download(
+        download_list,
+        config=cfg,
+        headers=headers,
+        cookie=cookie,
+    )
+
+    if is_success and len(download_list) > 0 and await cfg.DL_LIST_CACHE_PATH.exists():
+        await cfg.DL_LIST_CACHE_PATH.unlink()
+        logger.debug(
+            "Cleanup complete: removed pending list cache %s",
+            cfg.DL_LIST_CACHE_PATH,
+        )
+
+    logger.info(
+        "RUN | status=completed | duration_sec=%.2f",
+        time.monotonic() - start_time,
+    )
 
 
 def cli():
@@ -304,6 +318,22 @@ def cli():
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable verbose logging."
     )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Only output warnings and errors.",
+    )
+    parser.add_argument(
+        "--update-asset-bundle-info-only",
+        action="store_true",
+        help="Fetch and update asset_bundle_info.json only; do not download bundles.",
+    )
+    parser.add_argument(
+        "--force-full-download",
+        action="store_true",
+        help="Ignore cached metadata and pending downloads, then download all matched bundles.",
+    )
     args = parser.parse_args()
 
     # Load the config python file as dynamic module
@@ -318,7 +348,9 @@ def cli():
     globals()["config"] = config
 
     # Set the logging level
-    if args.verbose:
+    if args.quiet:
+        log_level = logging.WARNING
+    elif args.verbose:
         log_level = logging.DEBUG
     else:
         log_level = logging.INFO
@@ -339,10 +371,14 @@ def cli():
         args.verbose,
     )
 
-    # Run the main function
     start_time = time.perf_counter()
     try:
-        asyncio.run(main())
+        asyncio.run(
+            main(
+                update_asset_bundle_info_only=args.update_asset_bundle_info_only,
+                force_full_download=args.force_full_download,
+            )
+        )
     finally:
         logger.info(
             "RUN | action=completed | duration_sec=%.2f",

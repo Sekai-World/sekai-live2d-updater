@@ -349,6 +349,7 @@ async def get_download_list(
     include_list: List[str] = None,
     exclude_list: List[str] = None,
     priority_list: List[str] = None,
+    force_full_download: bool = False,
 ) -> List[Tuple[str, Dict]]:
     """Generate the download list for the live2d asset bundles.
 
@@ -365,10 +366,10 @@ async def get_download_list(
 
     cached_asset_bundle_info = None
     cached_game_version_json = None
-    if await config.ASSET_BUNDLE_INFO_CACHE_PATH.exists():
+    if (not force_full_download) and await config.ASSET_BUNDLE_INFO_CACHE_PATH.exists():
         async with await open_file(config.ASSET_BUNDLE_INFO_CACHE_PATH) as f:
             cached_asset_bundle_info = json.loads(await f.read())
-    if await config.GAME_VERSION_JSON_CACHE_PATH.exists():
+    if (not force_full_download) and await config.GAME_VERSION_JSON_CACHE_PATH.exists():
         async with await open_file(config.GAME_VERSION_JSON_CACHE_PATH) as f:
             cached_game_version_json = json.loads(await f.read())
 
@@ -499,11 +500,6 @@ async def get_download_list(
                 ],
             )
     logger.debug("Download list length after filter: %s", len(download_list) if download_list else 0)
-
-    # Cache the download list
-    if download_list:
-        async with await open_file(config.DL_LIST_CACHE_PATH, "wb") as f:
-            await f.write(json.dumps(download_list, option=json.OPT_INDENT_2))
 
     # Cache the asset bundle info
     async with await open_file(config.ASSET_BUNDLE_INFO_CACHE_PATH, "wb") as f:
