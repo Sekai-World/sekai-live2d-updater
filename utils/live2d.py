@@ -1,6 +1,10 @@
+import asyncio
 import logging
+import os
 import struct
 from io import BytesIO
+from pathlib import Path as StdPath
+from pathlib import PurePosixPath
 from typing import Dict, List, Tuple
 from zlib import crc32
 
@@ -91,6 +95,29 @@ def find_binding(generic_bindings: List[UnityPy.classes.GenericBinding], index: 
     return None
 
 
+def _binding_curve_count(binding: UnityPy.classes.GenericBinding) -> int:
+    if binding.typeID != UnityPy.enums.ClassIDType.Transform:
+        return 1
+    if binding.attribute in [1, 3, 4]:
+        return 3
+    if binding.attribute == 2:
+        return 4
+    return 1
+
+
+def build_binding_info_lookup(
+    generic_bindings: List[UnityPy.classes.GenericBinding],
+) -> List[Tuple[str, str]]:
+    lookup: List[Tuple[str, str]] = []
+    for binding in generic_bindings:
+        mono_script = binding.script.deref().read()
+        target, bone_name = live2d_target_map[mono_script.m_Name]
+        if not bone_name:
+            bone_name = str(binding.path)
+        lookup.extend([(target, bone_name)] * _binding_curve_count(binding))
+    return lookup
+
+
 def process_streamed_clip(streamed_clip: List[int]) -> List:
     _b = struct.pack("I" * len(streamed_clip), *streamed_clip)
     bs = BinaryStream(BytesIO(_b))
@@ -111,44 +138,40 @@ def process_streamed_clip(streamed_clip: List[int]) -> List:
             continue
         ret.append({"time": time, "keyList": key_list})
 
-    for k, v in enumerate(ret):
-        if k < 2 or k == len(ret) - 1:
-            continue
-
-        for ck in v["keyList"]:
-            for fI in range(k - 1, 0, -1):
-                pre_frame = ret[fI]
-                pre_curve_key = next(
-                    (x for x in pre_frame["keyList"] if x.index == ck.index), None
-                )
-
-                if pre_curve_key:
-                    ck.inSlope = pre_curve_key.calc_next_in_slope(
-                        v["time"] - pre_frame["time"], ck
+    previous_curve_by_index = {}
+    for k, frame in enumerate(ret):
+        if k >= 2 and k != len(ret) - 1:
+            for curve_key in frame["keyList"]:
+                previous_curve = previous_curve_by_index.get(curve_key.index)
+                if previous_curve:
+                    previous_time, previous_curve_key = previous_curve
+                    curve_key.inSlope = previous_curve_key.calc_next_in_slope(
+                        frame["time"] - previous_time,
+                        curve_key,
                     )
-                    break
+        if k > 0:
+            for curve_key in frame["keyList"]:
+                previous_curve_by_index[curve_key.index] = (frame["time"], curve_key)
 
     return ret
 
 
 def read_streamed_data(
     motion: Dict,
-    clip_binding_constant: UnityPy.classes.AnimationClipBindingConstant,
+    binding_info_lookup: List[Tuple[str, str]],
+    track_by_name: Dict[str, Dict],
     time: float,
     curve_key: StreamedCurveKey,
 ):
     idx = curve_key.index
-    binding_constant = find_binding(clip_binding_constant.genericBindings, idx)
-    if binding_constant is None:
+    try:
+        target, bone_name = binding_info_lookup[idx]
+    except IndexError:
         raise RuntimeError(
-            f"Failed to find binding constant for {idx} in {clip_binding_constant}"
+            f"Failed to find binding constant for {idx}"
         )
-    mono_script = binding_constant.script.deref().read()
-    target, bone_name = live2d_target_map[mono_script.m_Name]
-    if not bone_name:
-        bone_name = str(binding_constant.path)
     if bone_name:
-        track = next((x for x in motion["TrackList"] if x["Name"] == bone_name), None)
+        track = track_by_name.get(bone_name)
         if not track:
             track = {
                 "Name": bone_name,
@@ -164,6 +187,7 @@ def read_streamed_data(
                 ],
             }
             motion["TrackList"].append(track)
+            track_by_name[bone_name] = track
         else:
             # track["Target"] = target
             track["Curve"].append(
@@ -179,23 +203,21 @@ def read_streamed_data(
 
 def read_curve_data(
     motion: Dict,
-    clip_binding_constant: UnityPy.classes.AnimationClipBindingConstant,
+    binding_info_lookup: List[Tuple[str, str]],
+    track_by_name: Dict[str, Dict],
     idx: int,
     time: float,
     sample_list: List[float],
     curve_idx: int,
 ):
-    binding_constant = find_binding(clip_binding_constant.genericBindings, idx)
-    if binding_constant is None:
+    try:
+        target, bone_name = binding_info_lookup[idx]
+    except IndexError:
         raise RuntimeError(
-            f"Failed to find binding constant for {idx} in {clip_binding_constant}"
+            f"Failed to find binding constant for {idx}"
         )
-    mono_script = binding_constant.script.deref().read()
-    target, bone_name = live2d_target_map[mono_script.m_Name]
-    if not bone_name:
-        bone_name = str(binding_constant.path)
     if bone_name:
-        track = next((x for x in motion["TrackList"] if x["Name"] == bone_name), None)
+        track = track_by_name.get(bone_name)
         if not track:
             track = {
                 "Name": bone_name,
@@ -211,6 +233,7 @@ def read_curve_data(
                 ],
             }
             motion["TrackList"].append(track)
+            track_by_name[bone_name] = track
         else:
             # track["Target"] = target
             track["Curve"].append(
@@ -272,12 +295,14 @@ def restore_unity_object_to_motion3(unity_object) -> Tuple | None:
     clip_binding_constant = animation_clip.m_ClipBindingConstant
     if not clip_binding_constant:
         raise RuntimeError(f"Failed to read clip binding constant {asset_name}")
+    binding_info_lookup = build_binding_info_lookup(clip_binding_constant.genericBindings)
+    track_by_name: Dict[str, Dict] = {}
 
     # Fill streamed frames
     for frame in streamed_frames:
         time = frame["time"]
         for curve_key in frame["keyList"]:
-            read_streamed_data(motion, clip_binding_constant, time, curve_key)
+            read_streamed_data(motion, binding_info_lookup, track_by_name, time, curve_key)
 
     # Read dense clip
     dense_clip = animation_clip.m_MuscleClip.m_Clip.data.m_DenseClip
@@ -291,7 +316,8 @@ def restore_unity_object_to_motion3(unity_object) -> Tuple | None:
             idx = stream_count + curve_idx
             read_curve_data(
                 motion,
-                clip_binding_constant,
+                binding_info_lookup,
+                track_by_name,
                 idx,
                 time,
                 dense_clip.m_SampleArray,
@@ -308,7 +334,13 @@ def restore_unity_object_to_motion3(unity_object) -> Tuple | None:
         for curve_idx in range(len(constant_clip.data)):
             idx = stream_count + dense_count + curve_idx
             read_curve_data(
-                motion, clip_binding_constant, idx, time2, constant_clip.data, curve_idx
+                motion,
+                binding_info_lookup,
+                track_by_name,
+                idx,
+                time2,
+                constant_clip.data,
+                curve_idx,
             )
         time2 = animation_clip.m_MuscleClip.m_StopTime
 
@@ -478,11 +510,141 @@ class Live2DBuildMotion:
         )
 
 
+def get_max_concurrent_motion_base_files(config=None) -> int:
+    value = getattr(
+        config,
+        "MAX_CONCURRENCY_MOTION_BASE_FILES",
+        max(1, (os.cpu_count() or 1) // 2),
+    )
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid MAX_CONCURRENCY_MOTION_BASE_FILES=%r, falling back to 1",
+            value,
+        )
+        return 1
+
+
+def _build_motion_save_dir(
+    buildmotiondata_path: str,
+    local_live2d_motion_extracted_dir: StdPath,
+) -> StdPath:
+    reldir = PurePosixPath(buildmotiondata_path).relative_to(
+        PurePosixPath(UNITY_FS_CONTAINER_BASE.as_posix())
+    ).parent
+    rel_parts = reldir.parts[1:]
+    if rel_parts[:2] == ("live2d", "motion"):
+        rel_parts = rel_parts[2:]
+    return local_live2d_motion_extracted_dir.joinpath(*rel_parts)
+
+
+def _restore_motion_base_bundle_sync(
+    motion_base_bundle_path: str,
+    local_live2d_motion_extracted_dir: str,
+    param_id_map: Dict[str, str],
+) -> str:
+    motion_bundle_path = StdPath(motion_base_bundle_path)
+    motion_base = UnityPy.load(motion_base_bundle_path)
+    if not motion_base:
+        raise RuntimeError(f"Failed to load motion bundle {motion_bundle_path}")
+
+    container_items = list(motion_base.container.items())
+    buildmotiondata_path, buildmotiondata = next(
+        (
+            (asset_path, obj.read())
+            for asset_path, obj in container_items
+            if obj.type.name == "MonoBehaviour"
+            and "buildmotiondata" in asset_path.lower()
+        ),
+        (None, None),
+    )
+    if not buildmotiondata_path or not buildmotiondata:
+        raise RuntimeError(f"Failed to find buildmotiondata in {motion_bundle_path}")
+
+    facials = [
+        restore_unity_object_to_motion3(facial)
+        for facial in buildmotiondata.Facials
+    ]
+    if not facials and not buildmotiondata.Motions:
+        logger.warning(
+            "No facials found in %s, try searching container items",
+            motion_bundle_path,
+        )
+        container_facials = [
+            Live2DBuildMotion(StdPath(asset_path).stem, pptr)
+            for asset_path, pptr in container_items
+            if PurePosixPath(asset_path).parent.name == "facial"
+            and PurePosixPath(asset_path).suffix == ".anim"
+        ]
+        if not container_facials:
+            raise RuntimeError(f"Failed to find facials in {motion_bundle_path}")
+        facials = [
+            restore_unity_object_to_motion3(facial) for facial in container_facials
+        ]
+    facials = [facial for facial in facials if facial is not None]
+    correct_param_ids(facials, param_id_map)
+
+    motions = [
+        restore_unity_object_to_motion3(motion)
+        for motion in buildmotiondata.Motions
+    ]
+    if not motions and not buildmotiondata.Motions:
+        logger.warning(
+            "No motions found in %s, try searching container items",
+            motion_bundle_path,
+        )
+        container_motions = [
+            Live2DBuildMotion(StdPath(asset_path).stem, pptr)
+            for asset_path, pptr in container_items
+            if PurePosixPath(asset_path).parent.name == "motion"
+            and PurePosixPath(asset_path).suffix == ".anim"
+        ]
+        if not container_motions:
+            raise RuntimeError(f"Failed to find motions in {motion_bundle_path}")
+        motions = [
+            restore_unity_object_to_motion3(motion) for motion in container_motions
+        ]
+    motions = [motion for motion in motions if motion is not None]
+    correct_param_ids(motions, param_id_map)
+
+    save_dir = _build_motion_save_dir(
+        buildmotiondata_path,
+        StdPath(local_live2d_motion_extracted_dir),
+    )
+
+    all_motion_names = {
+        "expressions": [name for name, _ in facials],
+        "motions": [name for name, _ in motions],
+    }
+    save_dir.mkdir(parents=True, exist_ok=True)
+    (save_dir / "BuildMotionData.json").write_bytes(
+        json.dumps(all_motion_names, option=json.OPT_INDENT_2)
+    )
+
+    facial_save_dir = save_dir / "facial"
+    facial_save_dir.mkdir(parents=True, exist_ok=True)
+    for name, motion in facials:
+        (facial_save_dir / f"{name}.motion3.json").write_bytes(
+            json.dumps(motion, option=json.OPT_INDENT_2)
+        )
+
+    motion_save_dir = save_dir / "motion"
+    motion_save_dir.mkdir(parents=True, exist_ok=True)
+    for name, motion in motions:
+        (motion_save_dir / f"{name}.motion3.json").write_bytes(
+            json.dumps(motion, option=json.OPT_INDENT_2)
+        )
+
+    return save_dir.as_posix()
+
+
 async def restore_live2d_motions(
     local_live2d_motion_bundle_cache_dir: Path,
     local_live2d_motion_extracted_dir: Path,
     local_live2d_model_extracted_dir: Path,
     unity_version: str,
+    config=None,
 ):
     UnityPy.config.FALLBACK_UNITY_VERSION = unity_version
 
@@ -503,126 +665,30 @@ async def restore_live2d_motions(
             param_id_map.update(extract_params_ids_from_moc3(moc3))
     logger.debug("Param ID map: %s", param_id_map)
 
-    # Process all motion bundles
+    motion_base_bundle_paths = []
     async for motion_base_bundle_path in local_live2d_motion_bundle_cache_dir.glob("*"):
-        montion_base = UnityPy.load(motion_base_bundle_path.as_posix())
-        if not montion_base:
-            raise RuntimeError(
-                f"Failed to load motion bundle {motion_base_bundle_path}"
-            )
+        motion_base_bundle_paths.append(motion_base_bundle_path)
 
-        container_items = montion_base.container.items()
-        # Find the buildmotiondata
-        buildmotiondata_path, buildmotiondata = next(
-            (
-                (i[0], i[1].read())
-                for i in container_items
-                if i[1].type.name == "MonoBehaviour"
-                and "buildmotiondata" in i[0].lower()
-            ),
-            None,
-        )
-        if not buildmotiondata:
-            raise RuntimeError(
-                f"Failed to find buildmotiondata in {motion_base_bundle_path}"
-            )
+    max_concurrency = get_max_concurrent_motion_base_files(config)
+    logger.info(
+        "Restoring %d live2d motion base bundle(s) with concurrency=%d",
+        len(motion_base_bundle_paths),
+        max_concurrency,
+    )
+    semaphore = asyncio.Semaphore(max_concurrency)
 
-        facials = [
-            restore_unity_object_to_motion3(facial)
-            for facial in buildmotiondata.Facials
-        ]
-        if not facials and not buildmotiondata.Motions:
-            logger.warning(
-                "No facials found in %s, try searching container items",
+    async def restore_one(motion_base_bundle_path: Path) -> None:
+        async with semaphore:
+            save_dir = await asyncio.to_thread(
+                _restore_motion_base_bundle_sync,
+                motion_base_bundle_path.as_posix(),
+                local_live2d_motion_extracted_dir.as_posix(),
+                param_id_map,
+            )
+            logger.info(
+                "Restored %s motion data to %s",
                 motion_base_bundle_path,
+                save_dir,
             )
-            # Try to find facials in container items
-            container_facials = [
-                Live2DBuildMotion(Path(asset_path).stem, pptr)
-                for asset_path, pptr in container_items
-                if Path(asset_path).parent.name == "facial"
-                and Path(asset_path).suffix == ".anim"
-            ]
-            if not container_facials:
-                logger.exception(
-                    "Failed to find facials in %s after searching container items",
-                    motion_base_bundle_path,
-                )
-                raise RuntimeError(
-                    f"Failed to find facials in {motion_base_bundle_path}"
-                )
-            facials = [
-                restore_unity_object_to_motion3(facial) for facial in container_facials
-            ]
-        # filter out empty facials
-        facials = [facial for facial in facials if facial is not None]
-        correct_param_ids(facials, param_id_map)
 
-        motions = [
-            restore_unity_object_to_motion3(motion)
-            for motion in buildmotiondata.Motions
-        ]
-        if not motions and not buildmotiondata.Motions:
-            logger.warning(
-                "No motions found in %s, try searching container items",
-                motion_base_bundle_path,
-            )
-            # Try to find motions in container items
-            container_motions = [
-                Live2DBuildMotion(Path(asset_path).stem, pptr)
-                for asset_path, pptr in container_items
-                if Path(asset_path).parent.name == "motion"
-                and Path(asset_path).suffix == ".anim"
-            ]
-            if not container_motions:
-                logger.exception(
-                    "Failed to find motions in %s after searching container items",
-                    motion_base_bundle_path,
-                )
-                raise RuntimeError(
-                    f"Failed to find motions in {motion_base_bundle_path}"
-                )
-            motions = [
-                restore_unity_object_to_motion3(motion) for motion in container_motions
-            ]
-        # filter out empty motions
-        motions = [motion for motion in motions if motion is not None]
-        correct_param_ids(motions, param_id_map)
-
-        _reldir = Path(buildmotiondata_path).relative_to(UNITY_FS_CONTAINER_BASE).parent
-        save_dir = local_live2d_motion_extracted_dir / _reldir.relative_to(
-            *_reldir.parts[:1]
-        ).relative_to("live2d/motion")
-        # Collect and write all motion names
-        all_motion_names = {
-            "expressions": [name for name, _ in facials],
-            "motions": [name for name, _ in motions],
-        }
-        all_motion_path = save_dir / "BuildMotionData.json"
-        await all_motion_path.parent.mkdir(parents=True, exist_ok=True)
-        async with await open_file(all_motion_path, "wb") as f:
-            await f.write(json.dumps(all_motion_names, option=json.OPT_INDENT_2))
-
-        # Write all facial expressions
-        facial_save_dir = save_dir / "facial"
-        await facial_save_dir.mkdir(parents=True, exist_ok=True)
-        for name, motion in facials:
-            async with await open_file(
-                facial_save_dir / f"{name}.motion3.json", "wb"
-            ) as f:
-                await f.write(json.dumps(motion, option=json.OPT_INDENT_2))
-
-        # Write all motions
-        motion_save_dir = save_dir / "motion"
-        await motion_save_dir.mkdir(parents=True, exist_ok=True)
-        for name, motion in motions:
-            async with await open_file(
-                motion_save_dir / f"{name}.motion3.json", "wb"
-            ) as f:
-                await f.write(json.dumps(motion, option=json.OPT_INDENT_2))
-
-        logger.info(
-            "Restored %s motion data to %s",
-            motion_base_bundle_path,
-            save_dir,
-        )
+    await asyncio.gather(*(restore_one(path) for path in motion_base_bundle_paths))
