@@ -77,6 +77,7 @@ async def do_download(dl_list: List[DownloadItem], config, headers, cookie) -> b
             config.ASSET_LOCAL_EXTRACTED_DIR / "live2d" / "motion",
             config.ASSET_LOCAL_EXTRACTED_DIR / "live2d" / "model",
             config.UNITY_VERSION,
+            config=config,
         )
 
     logger.info("Restoring completed, generating model list...")
